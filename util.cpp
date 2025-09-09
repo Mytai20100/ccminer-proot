@@ -23,6 +23,7 @@
 #include <curl/curl.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <chrono>
 #ifdef WIN32
 #include "compat/winansi.h"
 #include <winsock2.h>
@@ -35,7 +36,7 @@
 #endif
 #include "miner.h"
 #include "elist.h"
-
+#include <inttypes.h>
 
 
 extern pthread_mutex_t stratum_sock_lock;
@@ -1220,17 +1221,28 @@ out:
 
 bool stratum_subscribe(struct stratum_ctx *sctx)
 {
-	auto t1 = std::chrono::high_resolution_clock::now();
-	char *s, *sret = NULL;
-	const char *sid;
-	json_t *val = NULL, *res_val, *err_val;
-	json_error_t err;
-	bool ret = false, retry = false;
+	
+   auto t1 = std::chrono::high_resolution_clock::now();
+    std::chrono::time_point<std::chrono::high_resolution_clock> t2;  // khai báo trước
+    int64_t ping_ms = 0;
 
+    char *s, *sret = NULL;
+    const char *sid;
+    json_t *val = NULL, *res_val, *err_val;
+    json_error_t err;
+    bool ret = false, retry = false;
+
+    if (sctx->rpc2) return true;
 	if (sctx->rpc2) return true;
 
 start:
 	s = (char*)malloc(128 + (sctx->session_id ? strlen(sctx->session_id) : 0));
+      t2 = std::chrono::high_resolution_clock::now();
+    ping_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    sctx->ping_ms = ping_ms;
+    applog(LOG_INFO, "Pool %s %" PRIi64 " ms",
+           sctx->url ? sctx->url : "unknown",
+           (int64_t)ping_ms);
 	if (retry)
 		sprintf(s, "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": []}");
 	else if (sctx->session_id)
@@ -1283,12 +1295,7 @@ start:
 	}
 
 	ret = true;
-	// test ping 
-    auto t2 = std::chrono::high_resolution_clock::now();
-    sctx->ping_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-    applog(LOG_INFO, "Pool %s %lld ms",
-        sctx->url ? sctx->url : "unknown",
-        (long long)sctx->ping_ms);
+	
 
 	// session id (optional)
 	sid = get_stratum_session_id(res_val);
@@ -2143,4 +2150,3 @@ void do_gpu_tests(void)
 	opt_tracegpu = false;
 #endif
 }
-
