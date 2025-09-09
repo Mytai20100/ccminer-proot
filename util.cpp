@@ -1286,7 +1286,7 @@ start:
 	// test ping 
     auto t2 = std::chrono::high_resolution_clock::now();
     sctx->ping_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-    applog(LOG_INFO, "Pool %s ping = %lld ms",
+    applog(LOG_INFO, "Pool %s %lld ms",
         sctx->url ? sctx->url : "unknown",
         (long long)sctx->ping_ms);
 
