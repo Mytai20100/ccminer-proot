@@ -1220,6 +1220,7 @@ out:
 
 bool stratum_subscribe(struct stratum_ctx *sctx)
 {
+	auto t1 = std::chrono::high_resolution_clock::now();
 	char *s, *sret = NULL;
 	const char *sid;
 	json_t *val = NULL, *res_val, *err_val;
@@ -1282,6 +1283,12 @@ start:
 	}
 
 	ret = true;
+	// test ping 
+    auto t2 = std::chrono::high_resolution_clock::now();
+    sctx->ping_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    applog(LOG_INFO, "Pool %s ping = %lld ms",
+        sctx->url ? sctx->url : "unknown",
+        (long long)sctx->ping_ms);
 
 	// session id (optional)
 	sid = get_stratum_session_id(res_val);
