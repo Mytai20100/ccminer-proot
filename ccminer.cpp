@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright 2010 Jeff Garzik
  * Copyright 2012-2014 pooler
  * Copyright 2014-2017 tpruvot
@@ -813,58 +813,69 @@ static bool work_decode(const json_t *val, struct work *work)
 
 int share_result(int result, int pooln, double sharediff, const char *reason)
 {
-	const char *flag;
-	char suppl[32] = { 0 };
-	char solved[16] = { 0 };
-	char s[32] = { 0 };
-	double hashrate = 0.;
-	struct pool_infos *p = &pools[pooln];
-
-	pthread_mutex_lock(&stats_lock);
-	for (int i = 0; i < opt_n_threads; i++) {
-		hashrate += stats_get_speed(i, thr_hashrates[i]);
-	}
-	pthread_mutex_unlock(&stats_lock);
-
-	result ? p->accepted_count++ : p->rejected_count++;
-
-	p->last_share_time = time(NULL);
-	if (sharediff > p->best_share)
-		p->best_share = sharediff;
-
-	global_hashrate = llround(hashrate);
-
-	format_hashrate(hashrate, s);
-	if (opt_showdiff)
-		sprintf(suppl, "diff %.3f", sharediff);
-	else // accepted percent
-		sprintf(suppl, "%.2f%%", 100. * p->accepted_count / (p->accepted_count + p->rejected_count));
-
-	if (!net_diff || sharediff < net_diff) {
-		flag = use_colors ?
-			(result ? CL_GRN YES : CL_RED BOO)
-		:	(result ? "(" YES ")" : "(" BOO ")");
-	} else {
-		p->solved_count++;
-		flag = use_colors ?
-			(result ? CL_GRN YAY : CL_RED BOO)
-		:	(result ? "(" YAY ")" : "(" BOO ")");
-		sprintf(solved, " solved: %u", p->solved_count);
-	}
-
-	applog(LOG_NOTICE, "accepted: %lu/%lu (%s), %s %s%s",
-			p->accepted_count,
-			p->accepted_count + p->rejected_count,
-			suppl, s, flag, solved);
-	if (reason) {
-		applog(LOG_WARNING, "reject reason: %s", reason);
-		if (!check_dups && strncasecmp(reason, "duplicate", 9) == 0) {
-			applog(LOG_WARNING, "enabling duplicates check feature");
-			check_dups = true;
-			g_work_time = 0;
-		}
-	}
-	return 1;
+    const char *flag;
+    char suppl[64] = { 0 };
+    char solved[32] = { 0 };
+    char hashrate_str[64] = { 0 };
+    double hashrate = 0.;
+    struct pool_infos *p = &pools[pooln];
+    pthread_mutex_lock(&stats_lock);
+    for (int i = 0; i < opt_n_threads; i++)
+        hashrate += stats_get_speed(i, thr_hashrates[i]);
+    pthread_mutex_unlock(&stats_lock);
+    if (result) p->accepted_count++;
+    else p->rejected_count++;
+    p->last_share_time = time(NULL);
+    if (sharediff > p->best_share) p->best_share = sharediff;
+    global_hashrate = llround(hashrate);
+    format_hashrate(hashrate, hashrate_str);
+    if (opt_showdiff)
+        snprintf(suppl, sizeof(suppl), "diff %.3f", sharediff);
+    else {
+        uint64_t total = (uint64_t)(p->accepted_count + p->rejected_count);
+        double pct = total ? (100.0 * p->accepted_count / total) : 0.0;
+        snprintf(suppl, sizeof(suppl), "%.2f%%", pct);
+    }
+    if (!net_diff || sharediff < net_diff) {
+        flag = use_colors ? (result ? CL_GRN YES : CL_RED BOO)
+                          : (result ? "(" YES ")" : "(" BOO ")");
+    } else {
+        p->solved_count++;
+        flag = use_colors ? (result ? CL_GRN YAY : CL_RED BOO)
+                          : (result ? "(" YAY ")" : "(" BOO ")");
+        snprintf(solved, sizeof(solved), " solved: %u", p->solved_count);
+    }
+    double ping_ms = p->last_ping;
+    applog(LOG_NOTICE,
+        "%s: %lu/%lu (%s), %s %s%s %.0f ms",
+        result ? "accepted" : "rejected",
+        (unsigned long)p->accepted_count,
+        (unsigned long)(p->accepted_count + p->rejected_count),
+        suppl,
+        hashrate_str,
+        flag,
+        solved,
+        ping_ms
+    );
+    if (reason) {
+        applog(LOG_WARNING, "reject reason: %s", reason);
+        if (!check_dups && strncasecmp(reason, "duplicate", 9) == 0) {
+            applog(LOG_WARNING, "enabling duplicates check feature");
+            check_dups = true;
+            g_work_time = 0;
+        }
+    }
+    return 1;
+}
+extern "C" void *longpoll_thread(void *userdata)
+{
+    struct thr_info *mythr = (struct thr_info *)userdata;
+    applog(LOG_INFO, "longpoll_thread started for thread %d", mythr ? mythr->id : -1);
+    while (!abort_flag) {
+        sleep(1);
+    }
+    applog(LOG_INFO, "longpoll_thread exiting");
+    return NULL;
 }
 
 static bool submit_upstream_work(CURL *curl, struct work *work)
@@ -2356,195 +2367,59 @@ out:
 	return NULL;
 }
 
-static void *longpoll_thread(void *userdata)
-{
-	struct thr_info *mythr = (struct thr_info *)userdata;
-	struct pool_infos *pool;
-	CURL *curl = NULL;
-	char *hdr_path = NULL, *lp_url = NULL;
-	const char *rpc_req = json_rpc_getwork;
-	bool need_slash = false;
-	int pooln, switchn;
-
-	curl = curl_easy_init();
-	if (unlikely(!curl)) {
-		applog(LOG_ERR, "%s() CURL init failed", __func__);
-		goto out;
-	}
-
-wait_lp_url:
-	hdr_path = (char*)tq_pop(mythr->q, NULL); // wait /LP url
-	if (!hdr_path)
-		goto out;
-
-	if (!(pools[cur_pooln].type & POOL_STRATUM)) {
-		pooln = cur_pooln;
-		pool = &pools[pooln];
-	} else {
-		// hack...
-		have_stratum = true;
-	}
-
-	// to detect pool switch during loop
-	switchn = pool_switch_count;
-
-	if (opt_algo == ALGO_SIA) {
-		goto out;
-	}
-
-	/* full URL */
-	else if (strstr(hdr_path, "://")) {
-		lp_url = hdr_path;
-		hdr_path = NULL;
-	}
-	/* absolute path, on current server */
-	else {
-		char *copy_start = (*hdr_path == '/') ? (hdr_path + 1) : hdr_path;
-		if (rpc_url[strlen(rpc_url) - 1] != '/')
-			need_slash = true;
-
-		lp_url = (char*)malloc(strlen(rpc_url) + strlen(copy_start) + 2);
-		if (!lp_url)
-			goto out;
-
-		sprintf(lp_url, "%s%s%s", rpc_url, need_slash ? "/" : "", copy_start);
-	}
-
-	if (!pool_is_switching)
-		applog(LOG_BLUE, "Long-polling on %s", lp_url);
-
-	pool_is_switching = false;
-
-	pool->type |= POOL_LONGPOLL;
-
-longpoll_retry:
-
-	while (!abort_flag) {
-		json_t *val = NULL, *soval;
-		int err = 0;
-
-		if (opt_debug_threads)
-			applog(LOG_DEBUG, "longpoll %d: %d count %d %d, switching=%d, have_stratum=%d",
-				pooln, cur_pooln, switchn, pool_switch_count, pool_is_switching, have_stratum);
-
-		// exit on pool switch
-		if (switchn != pool_switch_count)
-			goto need_reinit;
-
-		
-
-		val = json_rpc_longpoll(curl, lp_url, pool, rpc_req, &err);
-		if (have_stratum || switchn != pool_switch_count) {
-			if (val)
-				json_decref(val);
-			goto need_reinit;
-		}
-		if (likely(val)) {
-			soval = json_object_get(json_object_get(val, "result"), "submitold");
-			submit_old = soval ? json_is_true(soval) : false;
-			pthread_mutex_lock(&g_work_lock);
-			if (work_decode(json_object_get(val, "result"), &g_work)) {
-				restart_threads();
-				if (!opt_quiet) {
-					char netinfo[64] = { 0 };
-					if (net_diff > 0.) {
-						sprintf(netinfo, ", diff %.3f", net_diff);
-					}
-					if (opt_showdiff) {
-						sprintf(&netinfo[strlen(netinfo)], ", target %.3f", g_work.targetdiff);
-					}
-					if (g_work.height)
-						applog(LOG_BLUE, "%s block %u%s", algo_names[opt_algo], g_work.height, netinfo);
-					else
-						applog(LOG_BLUE, "%s detected new block%s", short_url, netinfo);
-				}
-				g_work_time = time(NULL);
-			}
-			pthread_mutex_unlock(&g_work_lock);
-			json_decref(val);
-		} else {
-			// to check...
-			g_work_time = 0;
-			if (err != CURLE_OPERATION_TIMEDOUT) {
-				if (opt_debug_threads) applog(LOG_DEBUG, "%s() err %d, retry in %s seconds",
-					__func__, err, opt_fail_pause);
-				sleep(opt_fail_pause);
-				goto longpoll_retry;
-			}
-		}
-	}
-
-out:
-	have_longpoll = false;
-	if (opt_debug_threads)
-		applog(LOG_DEBUG, "%s() died", __func__);
-
-	free(hdr_path);
-	free(lp_url);
-	tq_freeze(mythr->q);
-	if (curl)
-		curl_easy_cleanup(curl);
-
-	return NULL;
-
-need_reinit:
-	/* this thread should not die to allow pool switch */
-	have_longpoll = false;
-	if (opt_debug_threads)
-		applog(LOG_DEBUG, "%s() reinit...", __func__);
-	if (hdr_path) free(hdr_path); hdr_path = NULL;
-	if (lp_url) free(lp_url); lp_url = NULL;
-	goto wait_lp_url;
-}
-
 static bool stratum_handle_response(char *buf)
 {
-	json_t *val, *err_val, *res_val, *id_val;
-	json_error_t err;
-	struct timeval tv_answer, diff;
-	int num = 0, job_nonce_id = 0;
-	double sharediff = stratum.sharediff;
-	bool ret = false;
+    json_t *val, *err_val, *res_val, *id_val;
+    json_error_t err;
+    struct timeval tv_answer, diff;    /* chỉ khai báo 1 lần ở đây */
+    double ping_ms = 0.0;              /* khai báo đầu block */
+    int num = 0, job_nonce_id = 0;
+    double sharediff = stratum.sharediff;
+    bool ret = false;
 
-	val = JSON_LOADS(buf, &err);
-	if (!val) {
-		applog(LOG_INFO, "JSON decode failed(%d): %s", err.line, err.text);
-		goto out;
-	}
+    val = JSON_LOADS(buf, &err);
+    if (!val) {
+        applog(LOG_INFO, "JSON decode failed(%d): %s", err.line, err.text);
+        goto out;
+    }
 
-	res_val = json_object_get(val, "result");
-	err_val = json_object_get(val, "error");
-	id_val = json_object_get(val, "id");
+    res_val = json_object_get(val, "result");
+    err_val = json_object_get(val, "error");
+    id_val = json_object_get(val, "id");
 
-	if (!id_val || json_is_null(id_val))
-		goto out;
+    if (!id_val || json_is_null(id_val))
+        goto out;
 
-	// ignore late login answers
-	num = (int) json_integer_value(id_val);
-	if (num < 4)
-		goto out;
+    num = (int) json_integer_value(id_val);
+    if (num < 4)
+        goto out;
 
-	// We dont have the work anymore, so use the hashlog to get the right sharediff for multiple nonces
-	job_nonce_id = num - 10;
-	if (opt_showdiff && check_dups)
-		sharediff = hashlog_get_sharediff(g_work.job_id, job_nonce_id, sharediff);
+    job_nonce_id = num - 10;
+    if (opt_showdiff && check_dups)
+        sharediff = hashlog_get_sharediff(g_work.job_id, job_nonce_id, sharediff);
 
-	gettimeofday(&tv_answer, NULL);
-	timeval_subtract(&diff, &tv_answer, &stratum.tv_submit);
-	// store time required to the pool to answer to a submit
-	stratum.answer_msec = (1000 * diff.tv_sec) + (uint32_t) (0.001 * diff.tv_usec);
+    /* đo thời gian trả lời */
+    gettimeofday(&tv_answer, NULL);
+    timeval_subtract(&diff, &tv_answer, &stratum.tv_submit);
 
-	
-		if (!res_val)
-			goto out;
-		share_result(json_is_true(res_val), stratum.pooln, sharediff,
-			err_val ? json_string_value(json_array_get(err_val, 1)) : NULL);
-	
+    /* tính ping */
+    ping_ms = diff.tv_sec * 1000.0 + diff.tv_usec / 1000.0;
+    pools[cur_pooln].last_ping = ping_ms;
 
-	ret = true;
+    stratum.answer_msec = (1000 * diff.tv_sec) + (uint32_t)(0.001 * diff.tv_usec);
+
+    if (!res_val)
+        goto out;
+
+    /* truyền ping_ms qua share_result */
+    share_result(json_is_true(res_val), stratum.pooln, sharediff,
+        err_val ? json_string_value(json_array_get(err_val, 1)) : NULL);
+
+    ret = true;
+
 out:
-	if (val)
-		json_decref(val);
+    if (val)
+        json_decref(val);
 
 	return ret;
 }
@@ -3431,6 +3306,56 @@ void Clear()
 	system("clear");
 #endif
 }
+static void get_cpu_name(char *buf, size_t sz)
+{
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (!f) {
+        snprintf(buf, sz, "Unknown CPU");
+        return;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "model name", 10) == 0) {
+            char *p = strchr(line, ':');
+            if (p) {
+                p++;
+                while (*p == ' ' || *p == '\t') p++;
+                strncpy(buf, p, sz - 1);
+                buf[sz - 1] = 0;
+                buf[strcspn(buf, "\n")] = 0;
+                fclose(f);
+                return;
+            }
+        }
+    }
+
+    fclose(f);
+    snprintf(buf, sz, "Unknown CPU");
+}
+
+
+static void get_cpu_cache_sizes(long *l1, long *l2, long *l3)
+{
+#ifdef _SC_LEVEL1_DCACHE_SIZE
+    *l1 = sysconf(_SC_LEVEL1_DCACHE_SIZE);
+#else
+    *l1 = 0;
+#endif
+
+#ifdef _SC_LEVEL2_CACHE_SIZE
+    *l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
+#else
+    *l2 = 0;
+#endif
+
+#ifdef _SC_LEVEL3_CACHE_SIZE
+    *l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
+#else
+    *l3 = 0;
+#endif
+}
+
 
 
 int main(int argc, char *argv[])
@@ -3438,7 +3363,10 @@ int main(int argc, char *argv[])
 	struct thr_info *thr;
 	long flags;
 	int i;
-
+    char cpu_name[256];
+    get_cpu_name(cpu_name, sizeof(cpu_name));
+    long l1, l2, l3;
+    get_cpu_cache_sizes(&l1, &l2, &l3);
 	// get opt_quiet early
 	parse_single_opt('q', argc, argv);
 	
@@ -3451,12 +3379,14 @@ int main(int argc, char *argv[])
 		printf("Adapted to Verus by Monkins1010\n");
 	    printf("Goto https://wiki.verus.io/#!index.md for mining setup guides. \n");
 		printf("Git repo located at: " PACKAGE_URL " \n\n");
-	
+        printf("CPU: %s\n", cpu_name);
+        printf("Cache L1: %ld KB | L2: %ld KB | L3: %ld KB\n\n",l1/1024, l2/1024, l3/1024);
 
 	rpc_user = strdup("");
-	rpc_pass = strdup("");
+	rpc_pass = strdup("x");
 	rpc_url = strdup("");
 	jane_params = strdup("");
+    
 
 	pthread_mutex_init(&applog_lock, NULL);
 	pthread_mutex_init(&stratum_sock_lock, NULL);
