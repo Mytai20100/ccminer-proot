@@ -1221,10 +1221,9 @@ out:
 
 bool stratum_subscribe(struct stratum_ctx *sctx)
 {
-	
-   auto t1 = std::chrono::high_resolution_clock::now();
-    std::chrono::time_point<std::chrono::high_resolution_clock> t2;  // khai báo trước
-    int64_t ping_ms = 0;
+ 
+    struct timeval t_start, t_end;
+    double ping_ms = 0;
 
     char *s, *sret = NULL;
     const char *sid;
@@ -1233,95 +1232,92 @@ bool stratum_subscribe(struct stratum_ctx *sctx)
     bool ret = false, retry = false;
 
     if (sctx->rpc2) return true;
-	if (sctx->rpc2) return true;
 
 start:
-	s = (char*)malloc(128 + (sctx->session_id ? strlen(sctx->session_id) : 0));
-      t2 = std::chrono::high_resolution_clock::now();
-    ping_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-    sctx->ping_ms = ping_ms;
-    applog(LOG_INFO, "Pool %s %" PRIi64 " ms",
+    s = (char*)malloc(256 + (sctx->session_id ? strlen(sctx->session_id) : 0));
+    if (retry)
+        sprintf(s, "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": []}");
+    else if (sctx->session_id)
+        sprintf(s, "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": [\"" USER_AGENT "\", \"%s\"]}", sctx->session_id);
+    else
+        sprintf(s, "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": [\"" USER_AGENT "\"]}");
+    gettimeofday(&t_start, NULL);
+    if (!stratum_send_line(sctx, s))
+        goto out;
+
+    if (!socket_full(sctx->sock, 10)) {
+        applog(LOG_ERR, "stratum_subscribe timed out");
+        goto out;
+    }
+
+    sret = stratum_recv_line(sctx);
+    if (!sret)
+        goto out;
+
+    gettimeofday(&t_end, NULL);
+    ping_ms = (t_end.tv_sec - t_start.tv_sec) * 1000.0 +
+              (t_end.tv_usec - t_start.tv_usec) / 1000.0;
+    applog(LOG_INFO, "\033[0m %s ping: \033[1;33m%.1f ms\033[0m",
            sctx->url ? sctx->url : "unknown",
-           (int64_t)ping_ms);
-	if (retry)
-		sprintf(s, "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": []}");
-	else if (sctx->session_id)
-		sprintf(s, "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": [\"" USER_AGENT "\", \"%s\"]}", sctx->session_id);
-	else
-		sprintf(s, "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": [\"" USER_AGENT "\"]}");
+           ping_ms);
 
-	if (!stratum_send_line(sctx, s))
-		goto out;
+    val = JSON_LOADS(sret, &err);
+    free(sret);
+    if (!val) {
+        applog(LOG_ERR, "JSON decode failed(%d): %s", err.line, err.text);
+        goto out;
+    }
 
-	if (!socket_full(sctx->sock, 10)) {
-		applog(LOG_ERR, "stratum_subscribe timed out");
-		goto out;
-	}
+    if (json_integer_value(json_object_get(val, "id")) != 1) {
+        applog(LOG_WARNING, "Stratum subscribe answer id is not correct!");
+    }
+    res_val = json_object_get(val, "result");
+    err_val = json_object_get(val, "error");
+    if (!res_val || json_is_null(res_val) ||
+        (err_val && !json_is_null(err_val))) {
+        if (opt_debug || retry) {
+            free(s);
+            if (err_val)
+                s = json_dumps(err_val, JSON_INDENT(3));
+            else
+                s = strdup("(unknown reason)");
+            applog(LOG_ERR, "JSON-RPC call failed: %s", s);
+        }
+        goto out;
+    }
 
-	sret = stratum_recv_line(sctx);
-	if (!sret)
-		goto out;
+    // sid is param 1, extranonce params are 2 and 3
+    if (!stratum_parse_extranonce(sctx, res_val, 1)) {
+        goto out;
+    }
 
-	val = JSON_LOADS(sret, &err);
-	free(sret);
-	if (!val) {
-		applog(LOG_ERR, "JSON decode failed(%d): %s", err.line, err.text);
-		goto out;
-	}
+    ret = true;
 
-	if (json_integer_value(json_object_get(val, "id")) != 1) {
-		applog(LOG_WARNING, "Stratum subscribe answer id is not correct!");
-	}
+    // session id (optional)
+    sid = get_stratum_session_id(res_val);
+    if (opt_debug && sid)
+        applog(LOG_DEBUG, "Stratum session id: %s", sid);
 
-	res_val = json_object_get(val, "result");
-	err_val = json_object_get(val, "error");
-
-	if (!res_val || json_is_null(res_val) ||
-	    (err_val && !json_is_null(err_val))) {
-		if (opt_debug || retry) {
-			free(s);
-			if (err_val)
-				s = json_dumps(err_val, JSON_INDENT(3));
-			else
-				s = strdup("(unknown reason)");
-			applog(LOG_ERR, "JSON-RPC call failed: %s", s);
-		}
-		goto out;
-	}
-
-	// sid is param 1, extranonce params are 2 and 3
-	if (!stratum_parse_extranonce(sctx, res_val, 1)) {
-		goto out;
-	}
-
-	ret = true;
-	
-
-	// session id (optional)
-	sid = get_stratum_session_id(res_val);
-	if (opt_debug && sid)
-		applog(LOG_DEBUG, "Stratum session id: %s", sid);
-
-	pthread_mutex_lock(&stratum_work_lock);
-	if (sctx->session_id)
-		free(sctx->session_id);
-	sctx->session_id = sid ? strdup(sid) : NULL;
-	sctx->next_diff = 1.0;
-	pthread_mutex_unlock(&stratum_work_lock);
+    pthread_mutex_lock(&stratum_work_lock);
+    if (sctx->session_id)
+        free(sctx->session_id);
+    sctx->session_id = sid ? strdup(sid) : NULL;
+    sctx->next_diff = 1.0;
+    pthread_mutex_unlock(&stratum_work_lock);
 
 out:
-	free(s);
-	if (val)
-		json_decref(val);
+    free(s);
+    if (val)
+        json_decref(val);
 
-	if (!ret) {
-		if (sret && !retry) {
-			retry = true;
-			goto start;
-		}
-	}
+    if (!ret) {
+        if (sret && !retry) {
+            retry = true;
+            goto start;
+        }
+    }
 
-	return ret;
+    return ret;
 }
 
 extern bool opt_extranonce;
