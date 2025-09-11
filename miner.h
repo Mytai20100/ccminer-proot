@@ -4,7 +4,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
+void *longpoll_thread(void *userdata);
 #include <ccminer-config.h>
 
 #include <stdbool.h>
@@ -664,12 +664,15 @@ struct pool_infos {
 	uint32_t work_time;
 	uint32_t wait_time;
 	uint32_t accepted_count;
+	//ping
+	struct timeval last_share_start; 
+    double last_ping;   
 	uint32_t rejected_count;
 	uint32_t solved_count;
 	uint32_t stales_count;
 	time_t last_share_time;
 	double best_share;
-	uint32_t disconnects;
+	uint32_t disconnects;  
 };
 
 extern struct pool_infos pools[MAX_POOLS];
