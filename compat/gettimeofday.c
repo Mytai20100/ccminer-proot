@@ -1,5 +1,4 @@
-#include < time.h >
-#include <windows.h> //I've ommited this line.
+#include <sys/time.h>//I've ommited this line.
 #if defined(_MSC_VER) || defined(_MSC_EXTENSIONS)
   #define DELTA_EPOCH_IN_MICROSECS  11644473600000000Ui64
 #else
@@ -47,7 +46,7 @@ int gettimeofday(struct timeval *tv, struct timezone *tz)
   return 0;
 }
 
-void usleep(__int64 waitTime) 
+void usleep(__int64_t waitTime) 
 { 
     if (waitTime > 0)
     {
@@ -76,7 +75,7 @@ void usleep(__int64 waitTime)
             QueryPerformanceCounter(&start);
             do {
                 QueryPerformanceCounter((LARGE_INTEGER*) &now);
-                elapsed = (__int64)((now.QuadPart - start.QuadPart) / (float)perfCnt.QuadPart * 1000 * 1000);
+                elapsed = (__int64_t)((now.QuadPart - start.QuadPart) / (float)perfCnt.QuadPart * 1000 * 1000);
             } while ( elapsed < waitTime );
         }
     }
