@@ -310,7 +310,7 @@ bool equi_stratum_submit(struct pool_infos *pool, struct work *work)
 	free(noncestr);
 
 	gettimeofday(&stratum.tv_submit, NULL);
-
+    gettimeofday(&pool->last_share_start, NULL); 
 	if(!stratum_send_line(&stratum, s)) {
 		applog(LOG_ERR, "%s stratum_send_line failed", __func__);
 		return false;
