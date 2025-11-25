@@ -63,6 +63,158 @@ BOOL WINAPI ConsoleHandler(DWORD);
 #ifdef USE_WRAPNVML
 nvml_handle *hnvml = NULL;
 #endif
+// hmm
+
+//system info
+#ifdef __linux__
+static double get_cpu_usage()
+{
+    static unsigned long long prev_total = 0;
+    static unsigned long long prev_idle = 0;
+    
+    FILE *fp = fopen("/proc/stat", "r");
+    if (!fp) return 0.0;
+    
+    char buffer[256];
+    if (!fgets(buffer, sizeof(buffer), fp)) {
+        fclose(fp);
+        return 0.0;
+    }
+    fclose(fp);
+    
+    unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
+    sscanf(buffer, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+           &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal);
+    
+    unsigned long long total = user + nice + system + idle + iowait + irq + softirq + steal;
+    unsigned long long idle_time = idle + iowait;
+    
+    if (prev_total == 0) {
+        prev_total = total;
+        prev_idle = idle_time;
+        usleep(100000); // 100ms
+        return get_cpu_usage();
+    }
+    
+    unsigned long long diff_total = total - prev_total;
+    unsigned long long diff_idle = idle_time - prev_idle;
+    
+    prev_total = total;
+    prev_idle = idle_time;
+    
+    if (diff_total == 0) return 0.0;
+    
+    return (double)(diff_total - diff_idle) * 100.0 / (double)diff_total;
+}
+
+static void get_memory_usage(unsigned long *total_kb, unsigned long *available_kb)
+{
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) {
+        *total_kb = 0;
+        *available_kb = 0;
+        return;
+    }
+    
+    char buffer[256];
+    unsigned long mem_total = 0, mem_available = 0, mem_free = 0;
+    unsigned long buffers = 0, cached = 0;
+    bool has_available = false;
+    
+    while (fgets(buffer, sizeof(buffer), fp)) {
+        if (sscanf(buffer, "MemTotal: %lu kB", &mem_total) == 1) continue;
+        if (sscanf(buffer, "MemAvailable: %lu kB", &mem_available) == 1) {
+            has_available = true;
+            continue;
+        }
+        if (sscanf(buffer, "MemFree: %lu kB", &mem_free) == 1) continue;
+        if (sscanf(buffer, "Buffers: %lu kB", &buffers) == 1) continue;
+        if (sscanf(buffer, "Cached: %lu kB", &cached) == 1) continue;
+    }
+    fclose(fp);
+    
+    *total_kb = mem_total;
+    
+    // Nếu có MemAvailable thì dùng, không thì tính gần đúng
+    if (has_available) {
+        *available_kb = mem_available;
+    } else {
+        *available_kb = mem_free + buffers + cached;
+    }
+}
+
+#elif defined(WIN32)
+#include <windows.h>
+#include <psapi.h>
+
+static double get_cpu_usage()
+{
+    static ULARGE_INTEGER prev_idle = {0};
+    static ULARGE_INTEGER prev_kernel = {0};
+    static ULARGE_INTEGER prev_user = {0};
+    
+    FILETIME idle_time, kernel_time, user_time;
+    
+    if (!GetSystemTimes(&idle_time, &kernel_time, &user_time))
+        return 0.0;
+    
+    ULARGE_INTEGER idle, kernel, user;
+    idle.LowPart = idle_time.dwLowDateTime;
+    idle.HighPart = idle_time.dwHighDateTime;
+    kernel.LowPart = kernel_time.dwLowDateTime;
+    kernel.HighPart = kernel_time.dwHighDateTime;
+    user.LowPart = user_time.dwLowDateTime;
+    user.HighPart = user_time.dwHighDateTime;
+    
+    if (prev_kernel.QuadPart == 0) {
+        prev_idle = idle;
+        prev_kernel = kernel;
+        prev_user = user;
+        Sleep(100);
+        return get_cpu_usage();
+    }
+    
+    ULONGLONG diff_idle = idle.QuadPart - prev_idle.QuadPart;
+    ULONGLONG diff_kernel = kernel.QuadPart - prev_kernel.QuadPart;
+    ULONGLONG diff_user = user.QuadPart - prev_user.QuadPart;
+    ULONGLONG diff_total = diff_kernel + diff_user;
+    
+    prev_idle = idle;
+    prev_kernel = kernel;
+    prev_user = user;
+    
+    if (diff_total == 0) return 0.0;
+    
+    return (double)(diff_total - diff_idle) * 100.0 / (double)diff_total;
+}
+
+static void get_memory_usage(unsigned long *total_kb, unsigned long *available_kb)
+{
+    MEMORYSTATUSEX mem_info;
+    mem_info.dwLength = sizeof(MEMORYSTATUSEX);
+    
+    if (GlobalMemoryStatusEx(&mem_info)) {
+        *total_kb = (unsigned long)(mem_info.ullTotalPhys / 1024);
+        *available_kb = (unsigned long)(mem_info.ullAvailPhys / 1024);
+    } else {
+        *total_kb = 0;
+        *available_kb = 0;
+    }
+}
+
+#else
+// Fallback cho các hệ điều hành khác
+static double get_cpu_usage()
+{
+    return 0.0;
+}
+
+static void get_memory_usage(unsigned long *total_kb, unsigned long *available_kb)
+{
+    *total_kb = 0;
+    *available_kb = 0;
+}
+#endif
 
 enum workio_commands {
 	WC_GET_WORK,
@@ -143,6 +295,14 @@ int opt_led_mode = 0;
 int opt_cudaschedule = -1;
 static bool opt_keep_clocks = false;
 
+// status 
+static volatile bool ccminer_paused = false;
+static pthread_t keyboard_thr_id;
+static time_t uptime = 0;
+static double min_ping_ms = 999999.0;
+static double max_ping_ms = 0.0;
+static uint64_t total_shares_submitted = 0;
+
 // un-linked to cmdline scrypt options (useless)
 int device_batchsize[MAX_GPUS] = { 0 };
 int device_texturecache[MAX_GPUS] = { 0 };
@@ -175,6 +335,7 @@ char *rpc_user = NULL;
 char *rpc_pass;
 char *rpc_url;
 char *short_url = NULL;
+char *worker_name = NULL;
 
 struct stratum_ctx stratum = { 0 };
 pthread_mutex_t stratum_sock_lock;
@@ -230,7 +391,6 @@ char *opt_api_mcast_des = strdup("");
 int opt_api_mcast_port = 4068;
 
 bool opt_stratum_stats = false;
-
 int cryptonight_fork = 1;
 
 static char const usage[] = "\
@@ -566,7 +726,7 @@ static void affine_to_cpu_mask(int id, unsigned long mask) {
 static inline void drop_policy(void) { }
 static void affine_to_cpu_mask(int id, uint8_t mask) { }
 #endif
-
+static void extract_worker_name(const char *username);
 static bool get_blocktemplate(CURL *curl, struct work *work);
 
 void get_currentalgo(char* buf, int sz)
@@ -818,17 +978,37 @@ int share_result(int result, int pooln, double sharediff, const char *reason)
     char solved[32] = { 0 };
     char hashrate_str[64] = { 0 };
     double hashrate = 0.;
+    char algo_display[32];
     struct pool_infos *p = &pools[pooln];
+    
+    // Cập nhật thống kê ping
+    double ping_ms = p->last_ping;
+    if (ping_ms > 0) {
+        if (ping_ms < min_ping_ms) min_ping_ms = ping_ms;
+        if (ping_ms > max_ping_ms) max_ping_ms = ping_ms;
+    }
+    
+    total_shares_submitted++;
+    
     pthread_mutex_lock(&stats_lock);
     for (int i = 0; i < opt_n_threads; i++)
         hashrate += stats_get_speed(i, thr_hashrates[i]);
     pthread_mutex_unlock(&stats_lock);
+    
     if (result) p->accepted_count++;
     else p->rejected_count++;
     p->last_share_time = time(NULL);
     if (sharediff > p->best_share) p->best_share = sharediff;
+    
     global_hashrate = llround(hashrate);
     format_hashrate(hashrate, hashrate_str);
+    
+    // Get algo display name
+    int algo = opt_algo;
+    if (algo == ALGO_CRYPTONIGHT)
+        algo = get_cryptonight_algo(cryptonight_fork);
+    snprintf(algo_display, sizeof(algo_display), "[%s]", algo_names[algo]);
+    
     if (opt_showdiff)
         snprintf(suppl, sizeof(suppl), "diff %.3f", sharediff);
     else {
@@ -836,29 +1016,21 @@ int share_result(int result, int pooln, double sharediff, const char *reason)
         double pct = total ? (100.0 * p->accepted_count / total) : 0.0;
         snprintf(suppl, sizeof(suppl), "%.2f%%", pct);
     }
-    if (!net_diff || sharediff < net_diff) {
-        flag = use_colors ? (result ? CL_GRN YES : CL_RED BOO)
-                          : (result ? "(" YES ")" : "(" BOO ")");
-    } else {
-        p->solved_count++;
-        flag = use_colors ? (result ? CL_GRN YAY : CL_RED BOO)
-                          : (result ? "(" YAY ")" : "(" BOO ")");
-        snprintf(solved, sizeof(solved), " solved: %u", p->solved_count);
-    }
-    double ping_ms = p->last_ping;
+    
+    const char* ping_color = ping_ms < 100 ? CL_GRN : (ping_ms < 300 ? CL_YLW : CL_RED);
+    const char* result_color = result ? CL_GRN : CL_RED;
+    const char* result_text = result ? "accepted" : "rejected";
+    
     applog(LOG_NOTICE,
-        "%s: %lu/%lu (%s), %s %s%s %.0f ms",
-        result ? "accepted" : "rejected",
-        (unsigned long)p->accepted_count,
-        (unsigned long)(p->accepted_count + p->rejected_count),
+        "CPU share %s%s%s %s[%s%5.0fms%s]%s %s %s%s[%d]%s",
+        result_color, result_text, CL_N,
+        CL_GRY, ping_color, ping_ms, CL_GRY, CL_N,
         suppl,
-        hashrate_str,
-        flag,
-        solved,
-        ping_ms
+        CL_GRY, algo_display, pooln, CL_N
     );
+    
     if (reason) {
-        applog(LOG_WARNING, "reject reason: %s", reason);
+        applog(LOG_WARNING, "%sreject reason:%s %s", CL_YLW, CL_N, reason);
         if (!check_dups && strncasecmp(reason, "duplicate", 9) == 0) {
             applog(LOG_WARNING, "enabling duplicates check feature");
             check_dups = true;
@@ -2291,11 +2463,33 @@ static void *miner_thread(void *userdata)
 
 		/* output */
 		if (!opt_quiet && loopcnt > 1 && (time(NULL) - tm_rate_log) > opt_maxlograte) {
-			format_hashrate(thr_hashrates[thr_id], s);
-			if(thr_hashrates[thr_id]>0)
-			gpulog(LOG_INFO, thr_id, "%s, %s", device_name[dev_id], s);
-			tm_rate_log = time(NULL);
-		}
+    if (thr_id == 0) {  
+        double total_hashrate = 0;
+        pthread_mutex_lock(&stats_lock);
+        for (int i = 0; i < opt_n_threads; i++)
+            total_hashrate += stats_get_speed(i, thr_hashrates[i]);
+        pthread_mutex_unlock(&stats_lock);
+        
+        char total_s[256];
+        format_hashrate(total_hashrate, total_s);
+        
+        applog(LOG_INFO, 
+            "%s================================================================%s",
+            CL_GRY, CL_N);
+        applog(LOG_INFO,
+            "%sCPU  :%s %s %s[%s%7lu%s|%s%6lu%s]%s",
+            CL_CYN, CL_N, total_s,
+            CL_GRY, CL_GRN, (unsigned long)pools[cur_pooln].accepted_count, CL_GRY,
+            CL_RED, (unsigned long)pools[cur_pooln].rejected_count, CL_GRY, CL_N);
+        applog(LOG_INFO,
+            "%sTotal:%s %s",
+            CL_CYN, CL_N, total_s);
+        applog(LOG_INFO,
+            "%s================================================================%s",
+            CL_GRY, CL_N);
+    }
+    tm_rate_log = time(NULL);
+}
 
 		/* ignore first loop hashrate */
 		if (firstwork_time && thr_id == (opt_n_threads - 1)) {
@@ -2799,6 +2993,7 @@ void parse_arg(int key, char *arg)
 	case 'u':
 		free(rpc_user);
 		rpc_user = strdup(arg);
+		extract_worker_name(arg);
 		pool_set_creds(cur_pooln);
 		break;
 	case 'o':			/* --url */
@@ -2860,6 +3055,7 @@ void parse_arg(int key, char *arg)
 		strncpy(rpc_user, arg, p - arg);
 		free(rpc_pass);
 		rpc_pass = strdup(p + 1);
+		extract_worker_name(rpc_user);
 		pool_set_creds(cur_pooln);
 		break;
 	case 'x':			/* --proxy */
@@ -3360,7 +3556,137 @@ static void get_cpu_cache_sizes(long *l1, long *l2, long *l3)
     *l3 = 0;
 #endif
 }
+// Name worker
 
+static void extract_worker_name(const char *username)
+{
+    if (!username) return;
+    
+    const char *dot = strchr(username, '.');  
+    if (dot && *(dot + 1) != '\0') {
+        if (worker_name) free(worker_name);
+        worker_name = strdup(dot + 1);
+        if (opt_debug)
+            applog(LOG_DEBUG, "Worker name extracted: %s", worker_name);
+    } else {
+        if (worker_name) free(worker_name);
+        worker_name = strdup("default");
+    }
+}
+static void display_miner_status()
+{
+    char algo_display[32];
+    int algo = opt_algo;
+    if (algo == ALGO_CRYPTONIGHT)
+        algo = get_cryptonight_algo(cryptonight_fork);
+    snprintf(algo_display, sizeof(algo_display), "[%s]", algo_names[algo]);
+    
+    time_t now = time(NULL);
+    time_t uptime = now - uptime;
+    int hours = uptime / 3600;
+    int minutes = (uptime % 3600) / 60;
+    int seconds = uptime % 60;
+    
+    double total_hashrate = 0;
+    pthread_mutex_lock(&stats_lock);
+    for (int i = 0; i < opt_n_threads; i++)
+        total_hashrate += stats_get_speed(i, thr_hashrates[i]);
+    pthread_mutex_unlock(&stats_lock);
+    
+    char hashrate_str[64];
+    format_hashrate(total_hashrate, hashrate_str);
+    
+    uint64_t total_accepted = 0;
+    uint64_t total_rejected = 0;
+    for (int i = 0; i < num_pools; i++) {
+        total_accepted += pools[i].accepted_count;
+        total_rejected += pools[i].rejected_count;
+    }
+    
+    double accept_rate = total_shares_submitted > 0 ? 
+        (double)total_accepted * 100.0 / total_shares_submitted : 0.0;
+    
+    applog(LOG_INFO, 
+        "%s================================================================%s",
+        CL_GRY, CL_N);
+    applog(LOG_INFO, "%sCcminer status%s %s", CL_CYN, CL_N, algo_display);
+    applog(LOG_INFO, 
+        "%s================================================================%s",
+        CL_GRY, CL_N);
+     if (worker_name && strcmp(worker_name, "default") != 0) {
+        applog(LOG_INFO, "%sWorker      :%s %s", 
+            CL_CYN, CL_N, worker_name);
+    }
+    applog(LOG_INFO, "%sUptime      :%s %02d:%02d:%02d", 
+        CL_CYN, CL_N, hours, minutes, seconds);
+    applog(LOG_INFO, "%sHashrate    :%s %s", 
+        CL_CYN, CL_N, hashrate_str);
+    applog(LOG_INFO, "%sAccepted    :%s %s%lu%s %s(%.1f%%)%s", 
+        CL_CYN, CL_N, CL_GRN, total_accepted, CL_N,
+        CL_GRY, accept_rate, CL_N);
+    applog(LOG_INFO, "%sRejected    :%s %s%lu%s", 
+        CL_CYN, CL_N, CL_RED, total_rejected, CL_N);
+    applog(LOG_INFO, "%sSubmitted   :%s %lu", 
+        CL_CYN, CL_N, total_shares_submitted);
+    
+    if (min_ping_ms < 999999.0) {
+        const char* min_color = min_ping_ms < 100 ? CL_GRN : 
+                               (min_ping_ms < 300 ? CL_YLW : CL_RED);
+        const char* max_color = max_ping_ms < 100 ? CL_GRN : 
+                               (max_ping_ms < 300 ? CL_YLW : CL_RED);
+        applog(LOG_INFO, "%sMin Ping    :%s %s%.0f ms%s", 
+            CL_CYN, CL_N, min_color, min_ping_ms, CL_N);
+        applog(LOG_INFO, "%sMax Ping    :%s %s%.0f ms%s", 
+            CL_CYN, CL_N, max_color, max_ping_ms, CL_N);
+    }
+    
+    applog(LOG_INFO, "%sDifficulty  :%s %.10f", 
+        CL_CYN, CL_N, stratum_diff);
+    applog(LOG_INFO, "%sPool        :%s %s", 
+        CL_CYN, CL_N, pools[cur_pooln].url);
+    applog(LOG_INFO, 
+        "%s================================================================%s",
+        CL_GRY, CL_N);
+}
+//hmm ;O
+static void* keyboard_thread(void* arg)
+{
+    char c;
+    
+    while (!abort_flag) {
+        c = getchar();
+        
+        switch(c) {
+            case 's':
+            case 'S':
+                display_miner_status();
+                break;
+                
+            case 'p':
+            case 'P':
+                ccminer_paused = !ccminer_paused;
+                if (ccminer_paused) {
+                    applog(LOG_WARNING, "Mining paused. Press 'p' to resume.");
+                    restart_threads();
+                } else {
+                    applog(LOG_INFO, "Mining resumed.");
+                }
+                break;
+                
+            case 'k':
+            case 'K':
+            case 'q':
+            case 'Q':
+                applog(LOG_INFO, "Exit requested by user...");
+                proper_exit(EXIT_CODE_OK);
+                break;
+        }
+        
+        usleep(100000); // 100ms
+    }
+    
+    return NULL;
+}
 
 
 int main(int argc, char *argv[])
@@ -3368,30 +3694,62 @@ int main(int argc, char *argv[])
 	struct thr_info *thr;
 	long flags;
 	int i;
-    char cpu_name[256];
-    get_cpu_name(cpu_name, sizeof(cpu_name));
-    long l1, l2, l3;
-    get_cpu_cache_sizes(&l1, &l2, &l3);
-	// get opt_quiet early
+	char cpu_name[256];
+	get_cpu_name(cpu_name, sizeof(cpu_name));
+	long l1, l2, l3;
+	get_cpu_cache_sizes(&l1, &l2, &l3);
 	parse_single_opt('q', argc, argv);
-	
 	Clear();
 	printf("*************************************************************\n");	
 	printf("*  ccminer CPU: " PACKAGE_VERSION " for Verushash v2.2.2 based on ccminer *\n");
 	printf("*************************************************************\n");	
-
-		printf("Originally based on Christian Buchner and Christian H. project\n");
-		printf("Adapted to Verus by Monkins1010\n");
-	    printf("Goto https://wiki.verus.io/#!index.md for mining setup guides. \n");
-		printf("Git repo located at: " PACKAGE_URL " \n\n");
-        printf("CPU: %s\n", cpu_name);
-        printf("Cache L1: %ld KB | L2: %ld KB | L3: %ld KB\n\n",l1/1024, l2/1024, l3/1024);
+	  printf("Originally based on Christian Buchner and Christian H. project\n");
+	  printf("Adapted to Verus by Monkins1010\n");
+	  printf("Goto https://wiki.verus.io/#!index.md for mining setup guides. \n");
+	  printf("Git repo located at: " PACKAGE_URL " \n\n");
+	double cpu_usage = get_cpu_usage();
+	unsigned long total_mem_kb = 0, avail_mem_kb = 0;
+	get_memory_usage(&total_mem_kb, &avail_mem_kb);
+	if (!opt_n_threads)
+    opt_n_threads = num_cpus; 
+    int actual_threads = opt_n_threads;
+    printf("%sCPU Model:%s %s %s(%d cores / %d threads)%s\n", 
+        CL_CYN, CL_N, cpu_name,
+        CL_GRY, num_cpus, opt_n_threads, CL_N);
+	
+	if (cpu_usage > 0.0) {
+		const char* cpu_color = cpu_usage > 80.0 ? CL_RED : (cpu_usage > 60.0 ? CL_YLW : CL_GRN);
+		printf("%sCPU Usage:%s %s%.1f%%%s\n", CL_CYN, CL_N, cpu_color, cpu_usage, CL_N);
+	}
+	
+	if (total_mem_kb > 0) {
+		unsigned long used_mem_kb = total_mem_kb - avail_mem_kb;
+		double mem_usage_percent = (double)used_mem_kb * 100.0 / (double)total_mem_kb;
+		const char* mem_color = mem_usage_percent > 80.0 ? CL_RED : (mem_usage_percent > 60.0 ? CL_YLW : CL_GRN);
+		
+		printf("%sMemory:%s %s%.1f%%%s %s(%.1f GB / %.1f GB used)%s\n",
+			CL_CYN, CL_N, 
+			mem_color, mem_usage_percent, CL_N,
+			CL_GRY, 
+			(double)used_mem_kb / (1024.0 * 1024.0),
+			(double)total_mem_kb / (1024.0 * 1024.0),
+			CL_N);
+	if (worker_name && strcmp(worker_name, "default") != 0) {
+        applog(LOG_INFO, "%sWorker      :%s %s", 
+            CL_CYN, CL_N, worker_name);
+    }
+	}
+	
+	printf("%sCache:%s L1 %ld KB %s|%s L2 %ld KB %s|%s L3 %ld KB\n\n",
+		CL_CYN, CL_N, l1/1024,
+		CL_GRY, CL_N, l2/1024,
+		CL_GRY, CL_N, l3/1024);
 
 	rpc_user = strdup("");
 	rpc_pass = strdup("x");
 	rpc_url = strdup("");
 	jane_params = strdup("");
-    
+
 
 	pthread_mutex_init(&applog_lock, NULL);
 	pthread_mutex_init(&stratum_sock_lock, NULL);
@@ -3670,7 +4028,14 @@ int main(int argc, char *argv[])
 		"using '%s' algorithm.",
 		opt_n_threads, opt_n_threads > 1 ? "s":"",
 		algo_names[opt_algo]);
-
+     uptime = time(NULL);
+	  pthread_t kb_thr;
+    if (pthread_create(&kb_thr, NULL, keyboard_thread, NULL)) {
+        applog(LOG_WARNING, "keyboard thread create failed, interactive mode disabled");
+    }
+    
+    applog(LOG_INFO, "%sPress 's' for status, 'p' to pause/resume, 'k' to exit%s", 
+        CL_CYN, CL_N);
 	/* main loop - simply wait for workio thread to exit */
 	pthread_join(thr_info[work_thr_id].pth, NULL);
 
