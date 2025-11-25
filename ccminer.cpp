@@ -134,8 +134,6 @@ static void get_memory_usage(unsigned long *total_kb, unsigned long *available_k
     fclose(fp);
     
     *total_kb = mem_total;
-    
-    // Nếu có MemAvailable thì dùng, không thì tính gần đúng
     if (has_available) {
         *available_kb = mem_available;
     } else {
@@ -203,7 +201,6 @@ static void get_memory_usage(unsigned long *total_kb, unsigned long *available_k
 }
 
 #else
-// Fallback cho các hệ điều hành khác
 static double get_cpu_usage()
 {
     return 0.0;
@@ -2463,33 +2460,49 @@ static void *miner_thread(void *userdata)
 
 		/* output */
 		if (!opt_quiet && loopcnt > 1 && (time(NULL) - tm_rate_log) > opt_maxlograte) {
-    if (thr_id == 0) {  
-        double total_hashrate = 0;
-        pthread_mutex_lock(&stats_lock);
-        for (int i = 0; i < opt_n_threads; i++)
-            total_hashrate += stats_get_speed(i, thr_hashrates[i]);
-        pthread_mutex_unlock(&stats_lock);
-        
-        char total_s[256];
-        format_hashrate(total_hashrate, total_s);
-        
-        applog(LOG_INFO, 
-            "%s================================================================%s",
-            CL_GRY, CL_N);
-        applog(LOG_INFO,
-            "%sCPU  :%s %s %s[%s%7lu%s|%s%6lu%s]%s",
-            CL_CYN, CL_N, total_s,
-            CL_GRY, CL_GRN, (unsigned long)pools[cur_pooln].accepted_count, CL_GRY,
-            CL_RED, (unsigned long)pools[cur_pooln].rejected_count, CL_GRY, CL_N);
-        applog(LOG_INFO,
-            "%sTotal:%s %s",
-            CL_CYN, CL_N, total_s);
-        applog(LOG_INFO,
-            "%s================================================================%s",
-            CL_GRY, CL_N);
-    }
-    tm_rate_log = time(NULL);
-}
+			double hashrate = 0;
+			char hashrate_str[64];
+			char algo_display[32];
+			int algo = opt_algo;
+			
+			if (algo == ALGO_CRYPTONIGHT)
+				algo = get_cryptonight_algo(cryptonight_fork);
+			snprintf(algo_display, sizeof(algo_display), "[%s]", algo_names[algo]);
+			
+			pthread_mutex_lock(&stats_lock);
+			for (int i = 0; i < opt_n_threads; i++)
+				hashrate += stats_get_speed(i, thr_hashrates[i]);
+			pthread_mutex_unlock(&stats_lock);
+			
+			format_hashrate(hashrate, hashrate_str);
+			
+			if (thr_hashrates[thr_id] > 0) {
+				char thr_hashrate_str[64];
+				format_hashrate(thr_hashrates[thr_id], thr_hashrate_str);
+				
+				applog(LOG_INFO, 
+					"%s================================================================%s",
+					CL_GRY, CL_N);
+				applog(LOG_INFO, "%s[%d]%s    %s%s",
+					CL_CYN, thr_id, CL_N, algo_display, CL_N);
+				applog(LOG_INFO,
+					"%sCPU  :%s %-15s %s[%s%7lu%s|%s%6lu%s|%s",
+					CL_CYN, CL_N, thr_hashrate_str,
+					CL_GRY, CL_GRN, (unsigned long)pools[cur_pooln].accepted_count, CL_GRY,
+					CL_RED, (unsigned long)pools[cur_pooln].rejected_count, CL_GRY, CL_N);
+				
+				if (thr_id == 0) {
+					applog(LOG_INFO,
+						"%sTotal:%s %s",
+						CL_CYN, CL_N, hashrate_str);
+				}
+				applog(LOG_INFO,
+					"%s================================================================%s",
+					CL_GRY, CL_N);
+			}
+			
+			tm_rate_log = time(NULL);
+		}
 
 		/* ignore first loop hashrate */
 		if (firstwork_time && thr_id == (opt_n_threads - 1)) {
