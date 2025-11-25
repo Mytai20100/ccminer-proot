@@ -963,6 +963,8 @@ char *stratum_recv_line(struct stratum_ctx *sctx)
 	ssize_t len, buflen;
 	char *tok, *sret = NULL;
 	int timeout = opt_timeout;
+	int retry_count = 0;
+	bool socket_alive = true;
 
 	if (!sctx->sockbuf)
 		return NULL;
@@ -970,42 +972,87 @@ char *stratum_recv_line(struct stratum_ctx *sctx)
 	if (!strstr(sctx->sockbuf, "\n")) {
 		bool ret = true;
 		time_t rstart = time(NULL);
+		
+		// Kiểm tra socket trước khi bắt đầu
+		if (!socket_full(sctx->sock, 1)) {
+			retry_count++;
+			if (retry_count > 2) {
+				applog(LOG_WARNING, "stratum socket not responding, attempting recovery...");
+				socket_alive = false;
+			}
+		}
+		
 		if (!socket_full(sctx->sock, timeout)) {
-			applog(LOG_ERR, "stratum_recv_line timed out");
+			applog(LOG_ERR, "stratum_recv_line timed out after %d seconds", timeout);
 			goto out;
 		}
+		
 		do {
 			char s[RBUFSIZE];
 			ssize_t n;
 
 			memset(s, 0, RBUFSIZE);
 			n = recv(sctx->sock, s, RECVSIZE, 0);
+			
 			if (!n) {
 				ret = false;
+				applog(LOG_ERR, "stratum connection closed by pool");
 				break;
 			}
+			
 			if (n < 0) {
-				if (!socket_blocks() || !socket_full(sctx->sock, 1)) {
+				retry_count++;
+				if (!socket_blocks()) {
 					ret = false;
+					applog(LOG_ERR, "stratum recv error: %d", errno);
 					break;
 				}
-			} else
+				// Retry với timeout ngắn hơn
+				if (!socket_full(sctx->sock, 1)) {
+					if (retry_count > 3) {
+						ret = false;
+						applog(LOG_ERR, "stratum recv retry limit exceeded");
+						break;
+					}
+					usleep(100000); // Sleep 100ms trước khi retry
+				}
+			} else {
 				stratum_buffer_append(sctx, s);
-		} while (time(NULL) - rstart < timeout && !strstr(sctx->sockbuf, "\n"));
+				retry_count = 0; // Reset counter khi nhận data thành công
+			}
+			
+			// Kiểm tra timeout tổng thể
+			if (time(NULL) - rstart >= timeout) {
+				ret = false;
+				applog(LOG_ERR, "stratum_recv_line total timeout exceeded");
+				break;
+			}
+			
+		} while (!strstr(sctx->sockbuf, "\n"));
 
 		if (!ret) {
-			if (opt_debug) applog(LOG_ERR, "stratum_recv_line failed");
+			if (opt_debug) 
+				applog(LOG_ERR, "stratum_recv_line failed (retries: %d)", retry_count);
 			goto out;
 		}
 	}
 
 	buflen = (ssize_t)strlen(sctx->sockbuf);
 	tok = strtok(sctx->sockbuf, "\n");
+	
 	if (!tok) {
-		applog(LOG_ERR, "stratum_recv_line failed to parse a newline-terminated string");
+		applog(LOG_ERR, "stratum_recv_line failed to parse newline-terminated string");
+		// Clear buffer để tránh lỗi lặp lại
+		sctx->sockbuf[0] = '\0';
 		goto out;
 	}
+	
 	sret = strdup(tok);
+	if (!sret) {
+		applog(LOG_ERR, "stratum_recv_line: memory allocation failed");
+		goto out;
+	}
+	
 	len = (ssize_t)strlen(sret);
 
 	if (buflen > len + 1)
@@ -1016,6 +1063,12 @@ char *stratum_recv_line(struct stratum_ctx *sctx)
 out:
 	if (sret && opt_protocol)
 		applog(LOG_DEBUG, "< %s", sret);
+	
+	// Nếu socket không sống, set flag để reconnect
+	if (!socket_alive && sctx) {
+		stratum_need_reset = true;
+	}
+	
 	return sret;
 }
 
@@ -1025,6 +1078,23 @@ static curl_socket_t opensocket_grab_cb(void *clientp, curlsocktype purpose,
 {
 	curl_socket_t *sock = (curl_socket_t *)clientp;
 	*sock = socket(addr->family, addr->socktype, addr->protocol);
+	
+	if (*sock == INVALID_SOCKET) {
+		applog(LOG_ERR, "opensocket_grab_cb: failed to create socket");
+		return CURL_SOCKET_BAD;
+	}
+	
+	// Set socket options để cải thiện kết nối
+	int opt = 1;
+	setsockopt(*sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&opt, sizeof(opt));
+	
+	// Set send/recv timeout
+	struct timeval tv;
+	tv.tv_sec = 30;
+	tv.tv_usec = 0;
+	setsockopt(*sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+	setsockopt(*sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+	
 	return *sock;
 }
 #endif
@@ -1033,10 +1103,14 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 {
 	CURL *curl;
 	int rc;
-
+	int connect_timeout = 10; 
+	int retry_attempts = 0;
+	const int max_retries = 2;	
 	pthread_mutex_lock(&stratum_sock_lock);
-	if (sctx->curl)
+	if (sctx->curl) {
 		curl_easy_cleanup(sctx->curl);
+		sctx->curl = NULL;
+	}
 	sctx->curl = curl_easy_init();
 	if (!sctx->curl) {
 		applog(LOG_ERR, "CURL initialization failed");
@@ -1046,27 +1120,54 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 	curl = sctx->curl;
 	if (!sctx->sockbuf) {
 		sctx->sockbuf = (char*)calloc(RBUFSIZE, 1);
+		if (!sctx->sockbuf) {
+			applog(LOG_ERR, "Failed to allocate socket buffer");
+			curl_easy_cleanup(curl);
+			sctx->curl = NULL;
+			pthread_mutex_unlock(&stratum_sock_lock);
+			return false;
+		}
 		sctx->sockbuf_size = RBUFSIZE;
 	}
 	sctx->sockbuf[0] = '\0';
 	pthread_mutex_unlock(&stratum_sock_lock);
-
 	if (url != sctx->url) {
 		free(sctx->url);
 		sctx->url = strdup(url);
+		if (!sctx->url) {
+			applog(LOG_ERR, "Failed to duplicate URL");
+			return false;
+		}
 	}
 	free(sctx->curl_url);
-	sctx->curl_url = (char*)malloc(strlen(url)+1);
-	sprintf(sctx->curl_url, "http%s", strstr(url, "://"));
-
+	const char *protocol_start = strstr(url, "://");
+	if (!protocol_start) {
+		applog(LOG_ERR, "Invalid URL format: %s", url);
+		return false;
+	}
+	sctx->curl_url = (char*)malloc(strlen(url) + 8);
+	if (!sctx->curl_url) {
+		applog(LOG_ERR, "Failed to allocate curl_url");
+		return false;
+	}
+	sprintf(sctx->curl_url, "http%s", protocol_start);
+	if (opt_debug)
+		applog(LOG_DEBUG, "Connecting to %s", sctx->curl_url);
 	if (opt_protocol)
 		curl_easy_setopt(curl, CURLOPT_VERBOSE, 1);
 	curl_easy_setopt(curl, CURLOPT_URL, sctx->curl_url);
 	curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1);
-	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, opt_timeout);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, connect_timeout);
 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, sctx->curl_err_str);
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
 	curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30); // Overall timeout
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L); // 1 byte/s
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 15L); // trong 15s
+	curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 600L); // Cache 10 phút
+	curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+	curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
+	curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
 	if (opt_proxy && opt_proxy_type != CURLPROXY_HTTP) {
 		curl_easy_setopt(curl, CURLOPT_PROXY, opt_proxy);
 		curl_easy_setopt(curl, CURLOPT_PROXYTYPE, opt_proxy_type);
@@ -1078,29 +1179,70 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 		else
 			curl_easy_setopt(curl, CURLOPT_PROXY, "");
 	}
+	
 #if LIBCURL_VERSION_NUM >= 0x070f06
 	curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION, sockopt_keepalive_cb);
 #endif
+
 #if LIBCURL_VERSION_NUM >= 0x071101
 	curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, opensocket_grab_cb);
 	curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, &sctx->sock);
 #endif
 	curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1);
-
-	rc = curl_easy_perform(curl);
-	if (rc) {
-		applog(LOG_ERR, "Stratum connection failed: %s", sctx->curl_err_str);
-		curl_easy_cleanup(curl);
-		sctx->curl = NULL;
-		return false;
-	}
-
+	do {
+		rc = curl_easy_perform(curl);
+		if (rc == CURLE_OK) {
+			if (opt_debug)
+				applog(LOG_DEBUG, "Stratum connected successfully");
 #if LIBCURL_VERSION_NUM < 0x071101
-	/* CURLINFO_LASTSOCKET is broken on Win64; only use it as a last resort */
-	curl_easy_getinfo(curl, CURLINFO_LASTSOCKET, (long *)&sctx->sock);
+			curl_easy_getinfo(curl, CURLINFO_LASTSOCKET, (long *)&sctx->sock);
 #endif
-
-	return true;
+			if (sctx->sock == INVALID_SOCKET || sctx->sock < 0) {
+				applog(LOG_ERR, "Invalid socket after connection");
+				curl_easy_cleanup(curl);
+				sctx->curl = NULL;
+				return false;
+			}
+			return true;
+		}
+		retry_attempts++;
+		if (retry_attempts <= max_retries) {
+			// Log lỗi chi tiết
+			applog(LOG_WARNING, "Stratum connection attempt %d/%d failed: %s", 
+			       retry_attempts, max_retries, sctx->curl_err_str);
+			int sleep_time = retry_attempts;
+			applog(LOG_INFO, "Retrying in %d second%s...", 
+			       sleep_time, sleep_time > 1 ? "s" : "");
+			sleep(sleep_time);
+			curl_easy_reset(curl);
+			curl_easy_setopt(curl, CURLOPT_URL, sctx->curl_url);
+			curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1);
+			curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, connect_timeout);
+			curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, sctx->curl_err_str);
+			curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
+			curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1);
+			curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30);
+			curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+			curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 15L);
+			curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 600L);
+			curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+			curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
+			curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+#if LIBCURL_VERSION_NUM >= 0x070f06
+			curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION, sockopt_keepalive_cb);
+#endif
+#if LIBCURL_VERSION_NUM >= 0x071101
+			curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, opensocket_grab_cb);
+			curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, &sctx->sock);
+#endif
+			curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1);
+		}
+	} while (rc != CURLE_OK && retry_attempts <= max_retries);
+	applog(LOG_ERR, "Stratum connection failed after %d attempts: %s", 
+	       retry_attempts, sctx->curl_err_str);
+	curl_easy_cleanup(curl);
+	sctx->curl = NULL;
+	return false;
 }
 
 void stratum_free_job(struct stratum_ctx *sctx)
@@ -1221,10 +1363,8 @@ out:
 
 bool stratum_subscribe(struct stratum_ctx *sctx)
 {
- 
-    struct timeval t_start, t_end;
+ struct timeval t_start, t_end, diff;
     double ping_ms = 0;
-
     char *s, *sret = NULL;
     const char *sid;
     json_t *val = NULL, *res_val, *err_val;
@@ -1232,7 +1372,6 @@ bool stratum_subscribe(struct stratum_ctx *sctx)
     bool ret = false, retry = false;
 
     if (sctx->rpc2) return true;
-
 start:
     s = (char*)malloc(256 + (sctx->session_id ? strlen(sctx->session_id) : 0));
     if (retry)
@@ -1244,19 +1383,18 @@ start:
     gettimeofday(&t_start, NULL);
     if (!stratum_send_line(sctx, s))
         goto out;
-
     if (!socket_full(sctx->sock, 10)) {
         applog(LOG_ERR, "stratum_subscribe timed out");
         goto out;
     }
-
     sret = stratum_recv_line(sctx);
     if (!sret)
         goto out;
 
     gettimeofday(&t_end, NULL);
-    ping_ms = (t_end.tv_sec - t_start.tv_sec) * 1000.0 +
-              (t_end.tv_usec - t_start.tv_usec) / 1000.0;
+    timeval_subtract(&diff, &t_end, &t_start);
+    ping_ms = diff.tv_sec * 1000.0 + diff.tv_usec / 1000.0;
+    pools[sctx->pooln].last_ping = ping_ms;
     applog(LOG_INFO, "\033[0m %s ping: \033[1;33m%.1f ms\033[0m",
            sctx->url ? sctx->url : "unknown",
            ping_ms);
