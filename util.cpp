@@ -171,7 +171,7 @@ void gpulog(int prio, int thr_id, const char *fmt, ...)
 		return;
 
 
-	len = snprintf(pfmt, 128, "CPU T%d: Verus Hashing", thr_id, fmt);
+	len = snprintf(pfmt, 128, "CPU T%d: %s", thr_id, fmt);
 
 	pfmt[sizeof(pfmt)-1]='\0';
 
@@ -1108,7 +1108,8 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 	int rc;
 	int connect_timeout = 10; 
 	int retry_attempts = 0;
-	const int max_retries = 2;	
+	const int max_retries = 2;
+	
 	pthread_mutex_lock(&stratum_sock_lock);
 	if (sctx->curl) {
 		curl_easy_cleanup(sctx->curl);
@@ -1121,6 +1122,7 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 		return false;
 	}
 	curl = sctx->curl;
+	
 	if (!sctx->sockbuf) {
 		sctx->sockbuf = (char*)calloc(RBUFSIZE, 1);
 		if (!sctx->sockbuf) {
@@ -1134,6 +1136,7 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 	}
 	sctx->sockbuf[0] = '\0';
 	pthread_mutex_unlock(&stratum_sock_lock);
+	
 	if (url != sctx->url) {
 		free(sctx->url);
 		sctx->url = strdup(url);
@@ -1142,20 +1145,24 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 			return false;
 		}
 	}
+	
 	free(sctx->curl_url);
 	const char *protocol_start = strstr(url, "://");
 	if (!protocol_start) {
 		applog(LOG_ERR, "Invalid URL format: %s", url);
 		return false;
 	}
+	
 	sctx->curl_url = (char*)malloc(strlen(url) + 8);
 	if (!sctx->curl_url) {
 		applog(LOG_ERR, "Failed to allocate curl_url");
 		return false;
 	}
 	sprintf(sctx->curl_url, "http%s", protocol_start);
+	
 	if (opt_debug)
 		applog(LOG_DEBUG, "Connecting to %s", sctx->curl_url);
+	
 	if (opt_protocol)
 		curl_easy_setopt(curl, CURLOPT_VERBOSE, 1);
 	curl_easy_setopt(curl, CURLOPT_URL, sctx->curl_url);
@@ -1164,13 +1171,14 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, sctx->curl_err_str);
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
 	curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30); // Overall timeout
-	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L); // 1 byte/s
-	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 15L); // trong 15s
-	curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 600L); // Cache 10 phút
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30);
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 15L);
+	curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 600L);
 	curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
 	curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
 	curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+	
 	if (opt_proxy && opt_proxy_type != CURLPROXY_HTTP) {
 		curl_easy_setopt(curl, CURLOPT_PROXY, opt_proxy);
 		curl_easy_setopt(curl, CURLOPT_PROXYTYPE, opt_proxy_type);
@@ -1192,11 +1200,13 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 	curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, &sctx->sock);
 #endif
 	curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1);
+	
 	do {
 		rc = curl_easy_perform(curl);
 		if (rc == CURLE_OK) {
 			if (opt_debug)
-				applog(LOG_DEBUG, "Stratum connected successfully");
+				applog(LOG_DEBUG, "Stratum socket connected");
+
 #if LIBCURL_VERSION_NUM < 0x071101
 			curl_easy_getinfo(curl, CURLINFO_LASTSOCKET, (long *)&sctx->sock);
 #endif
@@ -1208,15 +1218,16 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 			}
 			return true;
 		}
+		
 		retry_attempts++;
 		if (retry_attempts <= max_retries) {
-			// Log lỗi chi tiết
-			applog(LOG_WARNING, "Stratum connection attempt %d/%d failed: %s", 
+			applog(LOG_WARNING, "Connection attempt %d/%d failed: %s", 
 			       retry_attempts, max_retries, sctx->curl_err_str);
 			int sleep_time = retry_attempts;
 			applog(LOG_INFO, "Retrying in %d second%s...", 
 			       sleep_time, sleep_time > 1 ? "s" : "");
 			sleep(sleep_time);
+			
 			curl_easy_reset(curl);
 			curl_easy_setopt(curl, CURLOPT_URL, sctx->curl_url);
 			curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1);
@@ -1241,6 +1252,7 @@ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
 			curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1);
 		}
 	} while (rc != CURLE_OK && retry_attempts <= max_retries);
+	
 	applog(LOG_ERR, "Stratum connection failed after %d attempts: %s", 
 	       retry_attempts, sctx->curl_err_str);
 	curl_easy_cleanup(curl);
@@ -1366,13 +1378,15 @@ out:
 
 bool stratum_subscribe(struct stratum_ctx *sctx)
 {
- struct timeval t_start, t_end, diff;
+    struct timeval t_start, t_end, diff;
     double ping_ms = 0;
     char *s, *sret = NULL;
     const char *sid;
     json_t *val = NULL, *res_val, *err_val;
     json_error_t err;
     bool ret = false, retry = false;
+    char algo_name[64] = { 0 };     
+    const char *host_start = NULL;   
 
     if (sctx->rpc2) return true;
 start:
@@ -1383,13 +1397,16 @@ start:
         sprintf(s, "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": [\"" USER_AGENT "\", \"%s\"]}", sctx->session_id);
     else
         sprintf(s, "{\"id\": 1, \"method\": \"mining.subscribe\", \"params\": [\"" USER_AGENT "\"]}");
+    
     gettimeofday(&t_start, NULL);
     if (!stratum_send_line(sctx, s))
         goto out;
+    
     if (!socket_full(sctx->sock, 10)) {
         applog(LOG_ERR, "stratum_subscribe timed out");
         goto out;
     }
+    
     sret = stratum_recv_line(sctx);
     if (!sret)
         goto out;
@@ -1398,9 +1415,25 @@ start:
     timeval_subtract(&diff, &t_end, &t_start);
     ping_ms = diff.tv_sec * 1000.0 + diff.tv_usec / 1000.0;
     pools[sctx->pooln].last_ping = ping_ms;
-    applog(LOG_INFO, "\033[0m %s ping: \033[1;33m%.1f ms\033[0m",
-           sctx->url ? sctx->url : "unknown",
-           ping_ms);
+    get_currentalgo(algo_name, sizeof(algo_name));
+    host_start = strstr(sctx->url, "://");
+    if (host_start) {
+        host_start += 3;
+        char display_host[256];
+        strncpy(display_host, host_start, sizeof(display_host)-1);
+        display_host[sizeof(display_host)-1] = '\0';
+        
+        char *port_sep = strchr(display_host, ':');
+        if (port_sep) *port_sep = '\0';
+        
+        const char *ping_color = ping_ms < 100 ? CL_GRN : (ping_ms < 300 ? CL_YLW : CL_RED);
+        
+        applog(LOG_INFO, "%sConnected to%s %s %s[%s]%s %s[%s%.0fms%s]%s",
+               CL_CYN, CL_N,
+               display_host,
+               CL_GRY, algo_name, CL_N,
+               CL_GRY, ping_color, ping_ms, CL_GRY, CL_N);
+    }
 
     val = JSON_LOADS(sret, &err);
     free(sret);
@@ -1597,10 +1630,10 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	int merkle_count, i, p=0;
 	json_t *merkle_arr;
 	uchar **merkle = NULL;
-	// uchar(*merkle_tree)[32] = { 0 };
 	int ntime;
 	char algo[64] = { 0 };
 	get_currentalgo(algo, sizeof(algo));
+
 	bool has_claim = !strcmp(algo, "lbry");
 	bool has_roots = !strcmp(algo, "phi2") && json_array_size(params) == 10;
 
@@ -1610,6 +1643,13 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 
 	job_id = json_string_value(json_array_get(params, p++));
 	prevhash = json_string_value(json_array_get(params, p++));
+	
+	// CRITICAL FIX: Kiểm tra job_id TRƯỚC KHI sử dụng
+	if (!job_id) {
+		applog(LOG_ERR, "Stratum notify: invalid or null job_id");
+		goto out;
+	}
+	
 	if (has_claim) {
 		extradata = json_string_value(json_array_get(params, p++));
 		if (!extradata || strlen(extradata) != 64) {
@@ -1623,6 +1663,7 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 			goto out;
 		}
 	}
+	
 	coinb1 = json_string_value(json_array_get(params, p++));
 	coinb2 = json_string_value(json_array_get(params, p++));
 	merkle_arr = json_array_get(params, p++);
@@ -1635,7 +1676,7 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	clean = json_is_true(json_array_get(params, p)); p++;
 	solution = json_string_value(json_array_get(params, p++));
 
-	if (!job_id || !prevhash || !coinb1 || !coinb2 || !version || !nbits || !stime ||
+	if (!prevhash || !coinb1 || !coinb2 || !version || !nbits || !stime ||
 	    strlen(prevhash) != 64 || strlen(version) != 8 ||
 	    strlen(nbits) != 8 || strlen(stime) != 8) {
 		applog(LOG_ERR, "Stratum notify: invalid parameters");
@@ -1700,13 +1741,31 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	hex2bin(sctx->job.nbits, nbits, 4);
 	hex2bin(sctx->job.ntime, stime, 4);
 
-    hex2bin(sctx->job.solution, solution, 1344);
+	hex2bin(sctx->job.solution, solution, 1344);
 
 	sctx->job.clean = clean;
-
 	sctx->job.diff = sctx->next_diff;
 
 	pthread_mutex_unlock(&stratum_work_lock);
+
+	// Display job info - SAFE vì đã validate và có mutex lock
+	{
+		char algo_display[32] = { 0 };
+		char short_job_id[16] = {0};
+		size_t copy_len = strlen(job_id);
+		
+		snprintf(algo_display, sizeof(algo_display), "[%s]", algo);
+		
+		// Safe copy với length check
+		if (copy_len > 8) copy_len = 8;
+		strncpy(short_job_id, job_id, copy_len);
+		short_job_id[15] = '\0';  // Đảm bảo null-terminated
+		
+		applog(LOG_INFO, "%sJob received%s %s[%s%s%s]%s %s%s[%d]%s",
+			CL_CYN, CL_N,
+			CL_GRY, CL_CYN, short_job_id, CL_GRY, CL_N,
+			CL_GRY, algo_display, sctx->pooln, CL_N);
+	}
 
 	ret = true;
 
@@ -1717,17 +1776,31 @@ out:
 extern volatile time_t g_work_time;
 static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
 {
-	double diff;
+    double diff;
+    char algo[64] = { 0 };
+    char algo_display[32] = { 0 };
 
-	diff = json_number_value(json_array_get(params, 0));
-	if (diff <= 0.0)
-		return false;
+    diff = json_number_value(json_array_get(params, 0));
+    if (diff <= 0.0)
+        return false;
 
-	pthread_mutex_lock(&stratum_work_lock);
-	sctx->next_diff = diff;
-	pthread_mutex_unlock(&stratum_work_lock);
+    pthread_mutex_lock(&stratum_work_lock);
+    sctx->next_diff = diff;
+    pthread_mutex_unlock(&stratum_work_lock);
 
-	return true;
+    get_currentalgo(algo, sizeof(algo));
+    if (strlen(algo) > 0) {
+        snprintf(algo_display, sizeof(algo_display), "[%s]", algo);
+    } else {
+        strcpy(algo_display, "[unknown]");
+    }
+    
+    applog(LOG_INFO, "%sDifficulty%s %.10f %s%s[%d]%s",
+        CL_CYN, CL_N,
+        diff,
+        CL_GRY, algo_display, sctx->pooln, CL_N);
+
+    return true;
 }
 
 static bool stratum_reconnect(struct stratum_ctx *sctx, json_t *params)
