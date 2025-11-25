@@ -33,6 +33,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#ifndef INVALID_SOCKET       //hmm
+#define INVALID_SOCKET -1
+#endif
 #endif
 #include "miner.h"
 #include "elist.h"
@@ -42,7 +45,7 @@
 extern pthread_mutex_t stratum_sock_lock;
 extern pthread_mutex_t stratum_work_lock;
 extern bool opt_debug_diff;
-
+extern bool stratum_need_reset; 
 bool opt_tracegpu = false;
 
 struct data_buffer {
