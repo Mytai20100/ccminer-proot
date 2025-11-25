@@ -107,7 +107,7 @@ static bool opt_background = false;
 bool opt_quiet = false;
 int opt_maxlograte = 3;
 static int opt_retries = -1;
-static int opt_fail_pause = 30;
+static int opt_fail_pause = 5;
 int opt_time_limit = -1;
 int opt_shares_limit = -1;
 time_t firstwork_time = 0;
@@ -2431,22 +2431,19 @@ static void *stratum_thread(void *userdata)
 	stratum_ctx *ctx = &stratum;
 	int pooln, switchn;
 	char *s;
-
+    int connect_attempts = 0; 
 wait_stratum_url:
 	stratum.url = (char*)tq_pop(mythr->q, NULL);
 	if (!stratum.url)
 		goto out;
-
 	if (!pool_is_switching)
 		applog(LOG_BLUE, "Starting on %s", stratum.url);
-
 	ctx->pooln = pooln = cur_pooln;
 	switchn = pool_switch_count;
 	pool = &pools[pooln];
-
 	pool_is_switching = false;
 	stratum_need_reset = false;
-
+    connect_attempts = 0; 
 	while (!abort_flag) {
 		int failures = 0;
 
@@ -2456,6 +2453,7 @@ wait_stratum_url:
 				stratum_disconnect(&stratum);
 			else
 				stratum.url = strdup(pool->url); // may be useless
+			connect_attempts = 0; 
 		}
 
 		while (!stratum.curl && !abort_flag) {
@@ -2464,7 +2462,14 @@ wait_stratum_url:
 			g_work.data[0] = 0;
 			pthread_mutex_unlock(&g_work_lock);
 			restart_threads();
-
+			
+            connect_attempts++;
+            if (connect_attempts > 3) {
+                applog(LOG_WARNING, "Multiple connection failures, forcing reset...");
+                sleep(2);
+                stratum_disconnect(&stratum);
+                connect_attempts = 0;
+            }
 			if (!stratum_connect(&stratum, pool->url) ||
 			    !stratum_subscribe(&stratum) ||
 			    !stratum_authorize(&stratum, pool->user, pool->pass))
@@ -2487,7 +2492,7 @@ wait_stratum_url:
 				if (!opt_benchmark)
 					applog(LOG_ERR, "...retry after %d seconds", opt_fail_pause);
 				sleep(opt_fail_pause);
-			}
+			} else {connect_attempts = 0;}
 		}
 
 		
@@ -2803,7 +2808,7 @@ void parse_arg(int key, char *arg)
 			num_pools = max(cur_pooln+1, num_pools);
 			// change some defaults if multi pools
 			if (opt_retries == -1) opt_retries = 1;
-			if (opt_fail_pause == 30) opt_fail_pause = 5;
+			if (opt_fail_pause > 5) opt_fail_pause = 5;
 			if (opt_timeout == 300) opt_timeout = 60;
 		}
 		p = strstr(arg, "://");
