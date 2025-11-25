@@ -976,7 +976,7 @@ char *stratum_recv_line(struct stratum_ctx *sctx)
 		bool ret = true;
 		time_t rstart = time(NULL);
 		
-		// Kiểm tra socket trước khi bắt đầu
+		// Check socket before starting
 		if (!socket_full(sctx->sock, 1)) {
 			retry_count++;
 			if (retry_count > 2) {
@@ -1010,28 +1010,28 @@ char *stratum_recv_line(struct stratum_ctx *sctx)
 					applog(LOG_ERR, "stratum recv error: %d", errno);
 					break;
 				}
-				// Retry với timeout ngắn hơn
+				// Retry with shorter timeout
 				if (!socket_full(sctx->sock, 1)) {
 					if (retry_count > 3) {
 						ret = false;
 						applog(LOG_ERR, "stratum recv retry limit exceeded");
 						break;
 					}
-					usleep(100000); // Sleep 100ms trước khi retry
+					usleep(100000); // Sleep 100ms before retry
 				}
 			} else {
 				stratum_buffer_append(sctx, s);
-				retry_count = 0; // Reset counter khi nhận data thành công
+				retry_count = 0; // Reset counter on successful receive
 			}
 			
-			// Kiểm tra timeout tổng thể
+			// Check overall timeout
 			if (time(NULL) - rstart >= timeout) {
 				ret = false;
 				applog(LOG_ERR, "stratum_recv_line total timeout exceeded");
 				break;
 			}
 			
-		} while (!strstr(sctx->sockbuf, "\n"));
+		} while (!strstr(sctx->sockbuf, "\n"));  // <-- QUAN TRỌNG: dấu } và while này
 
 		if (!ret) {
 			if (opt_debug) 
@@ -1045,7 +1045,7 @@ char *stratum_recv_line(struct stratum_ctx *sctx)
 	
 	if (!tok) {
 		applog(LOG_ERR, "stratum_recv_line failed to parse newline-terminated string");
-		// Clear buffer để tránh lỗi lặp lại
+		// Clear buffer to avoid repeated errors
 		sctx->sockbuf[0] = '\0';
 		goto out;
 	}
@@ -1067,7 +1067,7 @@ out:
 	if (sret && opt_protocol)
 		applog(LOG_DEBUG, "< %s", sret);
 	
-	// Nếu socket không sống, set flag để reconnect
+	// If socket not alive, set flag to reconnect
 	if (!socket_alive && sctx) {
 		stratum_need_reset = true;
 	}
@@ -1086,8 +1086,6 @@ static curl_socket_t opensocket_grab_cb(void *clientp, curlsocktype purpose,
 		applog(LOG_ERR, "opensocket_grab_cb: failed to create socket");
 		return CURL_SOCKET_BAD;
 	}
-	
-	// Set socket options để cải thiện kết nối
 	int opt = 1;
 	setsockopt(*sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&opt, sizeof(opt));
 	
@@ -1630,6 +1628,7 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	int merkle_count, i, p=0;
 	json_t *merkle_arr;
 	uchar **merkle = NULL;
+	// uchar(*merkle_tree)[32] = { 0 };
 	int ntime;
 	char algo[64] = { 0 };
 	get_currentalgo(algo, sizeof(algo));
@@ -1644,7 +1643,6 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	job_id = json_string_value(json_array_get(params, p++));
 	prevhash = json_string_value(json_array_get(params, p++));
 	
-	// CRITICAL FIX: Kiểm tra job_id TRƯỚC KHI sử dụng
 	if (!job_id) {
 		applog(LOG_ERR, "Stratum notify: invalid or null job_id");
 		goto out;
@@ -1744,22 +1742,20 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	hex2bin(sctx->job.solution, solution, 1344);
 
 	sctx->job.clean = clean;
+
 	sctx->job.diff = sctx->next_diff;
 
 	pthread_mutex_unlock(&stratum_work_lock);
-
-	// Display job info - SAFE vì đã validate và có mutex lock
 	{
 		char algo_display[32] = { 0 };
 		char short_job_id[16] = {0};
 		size_t copy_len = strlen(job_id);
 		
+		get_currentalgo(algo, sizeof(algo));
 		snprintf(algo_display, sizeof(algo_display), "[%s]", algo);
-		
-		// Safe copy với length check
 		if (copy_len > 8) copy_len = 8;
 		strncpy(short_job_id, job_id, copy_len);
-		short_job_id[15] = '\0';  // Đảm bảo null-terminated
+		short_job_id[15] = '\0';
 		
 		applog(LOG_INFO, "%sJob received%s %s[%s%s%s]%s %s%s[%d]%s",
 			CL_CYN, CL_N,
@@ -1773,7 +1769,6 @@ out:
 	return ret;
 }
 
-extern volatile time_t g_work_time;
 static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
 {
     double diff;
@@ -1794,7 +1789,6 @@ static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
     } else {
         strcpy(algo_display, "[unknown]");
     }
-    
     applog(LOG_INFO, "%sDifficulty%s %.10f %s%s[%d]%s",
         CL_CYN, CL_N,
         diff,
