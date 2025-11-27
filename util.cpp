@@ -1621,153 +1621,156 @@ static uint32_t getblocheight(struct stratum_ctx *sctx)
 
 static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 {
-	const char *job_id, *prevhash, *coinb1, *coinb2, *version, *nbits, *stime;
-	const char *extradata = NULL, *solution = NULL;;
-	size_t coinb1_size, coinb2_size;
-	bool clean, ret = false;
-	int merkle_count, i, p=0;
-	json_t *merkle_arr;
-	uchar **merkle = NULL;
-	// uchar(*merkle_tree)[32] = { 0 };
-	int ntime;
-	char algo[64] = { 0 };
-	get_currentalgo(algo, sizeof(algo));
+    const char *job_id, *prevhash, *coinb1, *coinb2, *version, *nbits, *stime;
+    const char *extradata = NULL, *solution = NULL;
+    size_t coinb1_size, coinb2_size;
+    bool clean, ret = false;
+    int merkle_count, i, p = 0;
+    json_t *merkle_arr;
+    uchar **merkle = NULL;
+    int ntime;
+    char algo[64] = {0};
+    char algo_display[32] = {0};
+    char short_job_id[16] = {0};
+    size_t copy_len;
 
-	bool has_claim = !strcmp(algo, "lbry");
-	bool has_roots = !strcmp(algo, "phi2") && json_array_size(params) == 10;
+    get_currentalgo(algo, sizeof(algo));
 
-	if (sctx->is_equihash) {
-		return equi_stratum_notify(sctx, params);
-	}
+    bool has_claim = !strcmp(algo, "lbry");
+    bool has_roots = !strcmp(algo, "phi2") && json_array_size(params) == 10;
 
-	job_id = json_string_value(json_array_get(params, p++));
-	prevhash = json_string_value(json_array_get(params, p++));
-	
-	if (!job_id) {
-		applog(LOG_ERR, "Stratum notify: invalid or null job_id");
-		goto out;
-	}
-	
-	if (has_claim) {
-		extradata = json_string_value(json_array_get(params, p++));
-		if (!extradata || strlen(extradata) != 64) {
-			applog(LOG_ERR, "Stratum notify: invalid claim parameter");
-			goto out;
-		}
-	} else if (has_roots) {
-		extradata = json_string_value(json_array_get(params, p++));
-		if (!extradata || strlen(extradata) != 128) {
-			applog(LOG_ERR, "Stratum notify: invalid UTXO root parameter");
-			goto out;
-		}
-	}
-	
-	coinb1 = json_string_value(json_array_get(params, p++));
-	coinb2 = json_string_value(json_array_get(params, p++));
-	merkle_arr = json_array_get(params, p++);
-	if (!merkle_arr || !json_is_array(merkle_arr))
-		goto out;
-	merkle_count = (int) json_array_size(merkle_arr);
-	version = json_string_value(json_array_get(params, p++));
-	nbits = json_string_value(json_array_get(params, p++));
-	stime = json_string_value(json_array_get(params, p++));
-	clean = json_is_true(json_array_get(params, p)); p++;
-	solution = json_string_value(json_array_get(params, p++));
+    if (sctx->is_equihash) {
+        return equi_stratum_notify(sctx, params);
+    }
 
-	if (!prevhash || !coinb1 || !coinb2 || !version || !nbits || !stime ||
-	    strlen(prevhash) != 64 || strlen(version) != 8 ||
-	    strlen(nbits) != 8 || strlen(stime) != 8) {
-		applog(LOG_ERR, "Stratum notify: invalid parameters");
-		goto out;
-	}
+    job_id = json_string_value(json_array_get(params, p++));
+    prevhash = json_string_value(json_array_get(params, p++));
 
-	/* store stratum server time diff */
-	hex2bin((uchar *)&ntime, stime, 4);
-	ntime = swab32(ntime) - (uint32_t) time(0);
-	if (ntime > sctx->srvtime_diff) {
-		sctx->srvtime_diff = ntime;
-		if (opt_protocol && ntime > 20)
-			applog(LOG_DEBUG, "stratum time is at least %ds in the future", ntime);
-	}
+    if (!job_id) {
+        applog(LOG_ERR, "Stratum notify: invalid or null job_id");
+        goto out;
+    }
 
-	if (merkle_count)
-		merkle = (uchar**) malloc(merkle_count * sizeof(char *));
-	for (i = 0; i < merkle_count; i++) {
-		const char *s = json_string_value(json_array_get(merkle_arr, i));
-		if (!s || strlen(s) != 64) {
-			while (i--)
-				free(merkle[i]);
-			free(merkle);
-			applog(LOG_ERR, "Stratum notify: invalid Merkle branch");
-			goto out;
-		}
-		merkle[i] = (uchar*) malloc(32);
-		hex2bin(merkle[i], s, 32);
-	}
+    if (has_claim) {
+        extradata = json_string_value(json_array_get(params, p++));
+        if (!extradata || strlen(extradata) != 64) {
+            applog(LOG_ERR, "Stratum notify: invalid claim parameter");
+            goto out;
+        }
+    } else if (has_roots) {
+        extradata = json_string_value(json_array_get(params, p++));
+        if (!extradata || strlen(extradata) != 128) {
+            applog(LOG_ERR, "Stratum notify: invalid UTXO root parameter");
+            goto out;
+        }
+    }
 
-	pthread_mutex_lock(&stratum_work_lock);
+    coinb1 = json_string_value(json_array_get(params, p++));
+    coinb2 = json_string_value(json_array_get(params, p++));
+    merkle_arr = json_array_get(params, p++);
+    if (!merkle_arr || !json_is_array(merkle_arr))
+        goto out;
 
-	coinb1_size = strlen(coinb1) / 2;
-	coinb2_size = strlen(coinb2) / 2;
-	sctx->job.coinbase_size = coinb1_size + sctx->xnonce1_size +
-	                          sctx->xnonce2_size + coinb2_size;
+    merkle_count = (int)json_array_size(merkle_arr);
+    version = json_string_value(json_array_get(params, p++));
+    nbits = json_string_value(json_array_get(params, p++));
+    stime = json_string_value(json_array_get(params, p++));
+    clean = json_is_true(json_array_get(params, p)); p++;
+    solution = json_string_value(json_array_get(params, p++));
 
-	sctx->job.coinbase = (uchar*) realloc(sctx->job.coinbase, sctx->job.coinbase_size);
-	sctx->job.xnonce2 = sctx->job.coinbase + coinb1_size + sctx->xnonce1_size;
-	hex2bin(sctx->job.coinbase, coinb1, coinb1_size);
-	memcpy(sctx->job.coinbase + coinb1_size, sctx->xnonce1, sctx->xnonce1_size);
+    if (!prevhash || !coinb1 || !coinb2 || !version || !nbits || !stime ||
+        strlen(prevhash) != 64 || strlen(version) != 8 ||
+        strlen(nbits) != 8 || strlen(stime) != 8) {
+        applog(LOG_ERR, "Stratum notify: invalid parameters");
+        goto out;
+    }
 
-	if (!sctx->job.job_id || strcmp(sctx->job.job_id, job_id))
-		memset(sctx->job.xnonce2, 0, sctx->xnonce2_size);
-	hex2bin(sctx->job.xnonce2 + sctx->xnonce2_size, coinb2, coinb2_size);
+    hex2bin((uchar *)&ntime, stime, 4);
+    ntime = swab32(ntime) - (uint32_t)time(0);
+    if (ntime > sctx->srvtime_diff) {
+        sctx->srvtime_diff = ntime;
+        if (opt_protocol && ntime > 20)
+            applog(LOG_DEBUG, "stratum time is at least %ds in the future", ntime);
+    }
 
-	free(sctx->job.job_id);
-	sctx->job.job_id = strdup(job_id);
-	hex2bin(sctx->job.prevhash, prevhash, 32);
-	if (has_claim) hex2bin(sctx->job.extra, extradata, 32);
-	if (has_roots) hex2bin(sctx->job.extra, extradata, 64);
+    if (merkle_count)
+        merkle = (uchar**)malloc(merkle_count * sizeof(char*));
 
-	sctx->job.height = getblocheight(sctx);
+    for (i = 0; i < merkle_count; i++) {
+        const char *s = json_string_value(json_array_get(merkle_arr, i));
+        if (!s || strlen(s) != 64) {
+            while (i--)
+                free(merkle[i]);
+            free(merkle);
+            applog(LOG_ERR, "Stratum notify: invalid Merkle branch");
+            goto out;
+        }
+        merkle[i] = (uchar*)malloc(32);
+        hex2bin(merkle[i], s, 32);
+    }
 
-	for (i = 0; i < sctx->job.merkle_count; i++)
-		free(sctx->job.merkle[i]);
-	free(sctx->job.merkle);
-	sctx->job.merkle = merkle;
-	sctx->job.merkle_count = merkle_count;
+    pthread_mutex_lock(&stratum_work_lock);
 
-	hex2bin(sctx->job.version, version, 4);
-	hex2bin(sctx->job.nbits, nbits, 4);
-	hex2bin(sctx->job.ntime, stime, 4);
+    coinb1_size = strlen(coinb1) / 2;
+    coinb2_size = strlen(coinb2) / 2;
+    sctx->job.coinbase_size = coinb1_size + sctx->xnonce1_size +
+                              sctx->xnonce2_size + coinb2_size;
 
-	hex2bin(sctx->job.solution, solution, 1344);
+    sctx->job.coinbase = (uchar*)realloc(sctx->job.coinbase, sctx->job.coinbase_size);
+    sctx->job.xnonce2 = sctx->job.coinbase + coinb1_size + sctx->xnonce1_size;
+    hex2bin(sctx->job.coinbase, coinb1, coinb1_size);
+    memcpy(sctx->job.coinbase + coinb1_size, sctx->xnonce1, sctx->xnonce1_size);
 
-	sctx->job.clean = clean;
+    if (!sctx->job.job_id || strcmp(sctx->job.job_id, job_id))
+        memset(sctx->job.xnonce2, 0, sctx->xnonce2_size);
 
-	sctx->job.diff = sctx->next_diff;
+    hex2bin(sctx->job.xnonce2 + sctx->xnonce2_size, coinb2, coinb2_size);
 
-	pthread_mutex_unlock(&stratum_work_lock);
-	{
-		char algo_display[32] = { 0 };
-		char short_job_id[16] = {0};
-		size_t copy_len = strlen(job_id);
-		
-		get_currentalgo(algo, sizeof(algo));
-		snprintf(algo_display, sizeof(algo_display), "[%s]", algo);
-		if (copy_len > 8) copy_len = 8;
-		strncpy(short_job_id, job_id, copy_len);
-		short_job_id[15] = '\0';
-		
-		applog(LOG_INFO, "%sJob received%s %s[%s%s%s]%s %s%s[%d]%s",
-			CL_CYN, CL_N,
-			CL_GRY, CL_CYN, short_job_id, CL_GRY, CL_N,
-			CL_GRY, algo_display, sctx->pooln, CL_N);
-	}
+    free(sctx->job.job_id);
+    sctx->job.job_id = strdup(job_id);
+    hex2bin(sctx->job.prevhash, prevhash, 32);
 
-	ret = true;
+    if (has_claim) hex2bin(sctx->job.extra, extradata, 32);
+    if (has_roots) hex2bin(sctx->job.extra, extradata, 64);
+
+    sctx->job.height = getblocheight(sctx);
+
+    for (i = 0; i < sctx->job.merkle_count; i++)
+        free(sctx->job.merkle[i]);
+    free(sctx->job.merkle);
+
+    sctx->job.merkle = merkle;
+    sctx->job.merkle_count = merkle_count;
+
+    hex2bin(sctx->job.version, version, 4);
+    hex2bin(sctx->job.nbits, nbits, 4);
+    hex2bin(sctx->job.ntime, stime, 4);
+    hex2bin(sctx->job.solution, solution, 1344);
+
+    sctx->job.clean = clean;
+    sctx->job.diff = sctx->next_diff;
+
+    pthread_mutex_unlock(&stratum_work_lock);
+
+ret = true;
 
 out:
-	return ret;
+    char short_job_id2[16] = {0};
+    size_t copy_len2 = strlen(job_id);
+    if (copy_len2 > 8) copy_len2 = 8;
+    strncpy(short_job_id2, job_id, copy_len2);
+    short_job_id2[15] = '\0';
+
+    snprintf(algo_display, sizeof(algo_display), "[%s]", algo);
+
+    applog(LOG_INFO, "%sJob received%s %s[%s%s%s]%s %s%s[%d]%s",
+        CL_CYN, CL_N,
+        CL_GRY, CL_CYN, short_job_id2, CL_GRY, CL_N,
+        CL_GRY, algo_display, sctx->pooln, CL_N);
+
+    return ret;
 }
+
 
 static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
 {
@@ -1784,18 +1787,26 @@ static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
     pthread_mutex_unlock(&stratum_work_lock);
 
     get_currentalgo(algo, sizeof(algo));
-    if (strlen(algo) > 0) {
-        snprintf(algo_display, sizeof(algo_display), "[%s]", algo);
-    } else {
-        strcpy(algo_display, "[unknown]");
-    }
-    applog(LOG_INFO, "%sDifficulty%s %.10f %s%s[%d]%s",
-        CL_CYN, CL_N,
-        diff,
-        CL_GRY, algo_display, sctx->pooln, CL_N);
+    snprintf(algo_display, sizeof(algo_display), "[%s]", algo);
+
+    double inverse_diff = 1.0 / diff;
+
+    // timestamp giống job log
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "[%Y-%m-%d %H:%M:%S]", tm_info);
+
+    applog(LOG_INFO, "%s Difficulty %.10f %s[%d]",
+        timestamp,
+        inverse_diff,
+        algo_display,
+        sctx->pooln
+    );
 
     return true;
 }
+
 
 static bool stratum_reconnect(struct stratum_ctx *sctx, json_t *params)
 {
