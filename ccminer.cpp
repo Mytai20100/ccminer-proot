@@ -978,7 +978,6 @@ int share_result(int result, int pooln, double sharediff, const char *reason)
     char algo_display[32];
     struct pool_infos *p = &pools[pooln];
     
-    // Cập nhật thống kê ping
     double ping_ms = p->last_ping;
     if (ping_ms > 0) {
         if (ping_ms < min_ping_ms) min_ping_ms = ping_ms;
@@ -2459,62 +2458,82 @@ static void *miner_thread(void *userdata)
 			hashlog_remember_scan_range(&work);
 
 		/* output */
-		if (!opt_quiet && loopcnt > 1 && (time(NULL) - tm_rate_log) > opt_maxlograte) {
-			double hashrate = 0;
-			char hashrate_str[64];
-			char algo_display[32];
-			int algo = opt_algo;
-			
-			if (algo == ALGO_CRYPTONIGHT)
-				algo = get_cryptonight_algo(cryptonight_fork);
-			snprintf(algo_display, sizeof(algo_display), "[%s]", algo_names[algo]);
-			
-			pthread_mutex_lock(&stats_lock);
-			for (int i = 0; i < opt_n_threads; i++)
-				hashrate += stats_get_speed(i, thr_hashrates[i]);
-			pthread_mutex_unlock(&stats_lock);
-			
-			format_hashrate(hashrate, hashrate_str);
-			
-			if (thr_hashrates[thr_id] > 0) {
-				char thr_hashrate_str[64];
-				format_hashrate(thr_hashrates[thr_id], thr_hashrate_str);
-				
-				applog(LOG_INFO, 
-					"%s================================================================%s",
-					CL_GRY, CL_N);
-				applog(LOG_INFO, "%s[%d]%s    %s%s",
-					CL_CYN, thr_id, CL_N, algo_display, CL_N);
-				applog(LOG_INFO,
-					"%sCPU  :%s %-15s %s[%s%7lu%s|%s%6lu%s|%s",
-					CL_CYN, CL_N, thr_hashrate_str,
-					CL_GRY, CL_GRN, (unsigned long)pools[cur_pooln].accepted_count, CL_GRY,
-					CL_RED, (unsigned long)pools[cur_pooln].rejected_count, CL_GRY, CL_N);
-				
-				if (thr_id == 0) {
-					applog(LOG_INFO,
-						"%sTotal:%s %s",
-						CL_CYN, CL_N, hashrate_str);
-				}
-				applog(LOG_INFO,
-					"%s================================================================%s",
-					CL_GRY, CL_N);
-			}
-			
-			tm_rate_log = time(NULL);
-		}
+		 if (!opt_quiet && loopcnt > 1 && (time(NULL) - tm_rate_log) > opt_maxlograte) {
 
-		/* ignore first loop hashrate */
-		if (firstwork_time && thr_id == (opt_n_threads - 1)) {
-			double hashrate = 0.;
-			pthread_mutex_lock(&stats_lock);
-			for (int i = 0; i < opt_n_threads && thr_hashrates[i]; i++)
-				hashrate += stats_get_speed(i, thr_hashrates[i]);
-			pthread_mutex_unlock(&stats_lock);
-			if (opt_benchmark && bench_algo == -1 && loopcnt > 2) {
-				format_hashrate(hashrate, s);
-				applog(LOG_NOTICE, "Total: %s", s);
-			}
+    double hashrate = 0;
+    char hashrate_str[64];
+    char algo_display[32];
+    int algo = opt_algo;
+
+    if (algo == ALGO_CRYPTONIGHT)
+        algo = get_cryptonight_algo(cryptonight_fork);
+    snprintf(algo_display, sizeof(algo_display), "[%s]", algo_names[algo]);
+
+    pthread_mutex_lock(&stats_lock);
+    for (int i = 0; i < opt_n_threads; i++)
+        hashrate += stats_get_speed(i, thr_hashrates[i]);
+    pthread_mutex_unlock(&stats_lock);
+
+    format_hashrate(hashrate, hashrate_str);
+
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "[%Y-%m-%d %H:%M:%S]", tm_info);
+
+    if (thr_hashrates[thr_id] > 0) {
+        char thr_hashrate_str[64];
+        format_hashrate(thr_hashrates[thr_id], thr_hashrate_str);
+
+        if (thr_id == 0) {
+            applog(LOG_INFO,
+                "%s ============================================================== %s",
+                timestamp, "");
+        }
+
+        applog(LOG_INFO,
+            "%s [%d]    %s",
+            timestamp, thr_id, algo_display
+        );
+
+        applog(LOG_INFO,
+            "%s CPU  : %-15s [ %7lu|%6lu|",
+            timestamp,
+            thr_hashrate_str,
+            (unsigned long)pools[cur_pooln].accepted_count,
+            (unsigned long)pools[cur_pooln].rejected_count
+        );
+
+        if (thr_id == (opt_n_threads - 1)) {
+            applog(LOG_INFO,
+                "%s Total: %s",
+                timestamp,
+                hashrate_str
+            );
+
+            applog(LOG_INFO,
+                "%s ============================================================== %s",
+                timestamp, ""
+            );
+        }
+    }
+
+    tm_rate_log = time(NULL);
+}
+
+
+
+/* ignore first loop hashrate */
+if (firstwork_time && thr_id == (opt_n_threads - 1)) {
+	double hashrate = 0.;
+	pthread_mutex_lock(&stats_lock);
+	for (int i = 0; i < opt_n_threads && thr_hashrates[i]; i++)
+		hashrate += stats_get_speed(i, thr_hashrates[i]);
+	pthread_mutex_unlock(&stats_lock);
+	if (opt_benchmark && bench_algo == -1 && loopcnt > 2) {
+		format_hashrate(hashrate, s);
+		applog(LOG_NOTICE, "Total: %s", s);
+	}
 
 			// since pool start
 			pools[cur_pooln].work_time = (uint32_t) (time(NULL) - firstwork_time);
@@ -4074,3 +4093,4 @@ int main(int argc, char *argv[])
 	proper_exit(EXIT_CODE_OK);
 	return 0;
 }
+//oh
