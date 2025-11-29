@@ -1756,58 +1756,48 @@ ret = true;
 
 out:
     char short_job_id2[16] = {0};
-    size_t copy_len2 = strlen(job_id);
-    if (copy_len2 > 8) copy_len2 = 8;
-    strncpy(short_job_id2, job_id, copy_len2);
-    short_job_id2[15] = '\0';
+    if (job_id) {
+        size_t copy_len2 = strlen(job_id);
+        if (copy_len2 > 8) copy_len2 = 8;
+        strncpy(short_job_id2, job_id, copy_len2);
+        short_job_id2[15] = '\0';
+    }
 
     snprintf(algo_display, sizeof(algo_display), "[%s]", algo);
 
-    applog(LOG_INFO, "%sJob received%s %s[%s%s%s]%s %s%s[%d]%s",
-        CL_CYN, CL_N,
-        CL_GRY, CL_CYN, short_job_id2, CL_GRY, CL_N,
-        CL_GRY, algo_display, sctx->pooln, CL_N);
+    if (ret) {
+        applog(LOG_INFO, "%sJob received%s %s[%s%s%s]%s %s%s[%d]%s",
+            CL_CYN, CL_N,
+            CL_GRY, CL_CYN, short_job_id2, CL_GRY, CL_N,
+            CL_GRY, algo_display, sctx->pooln, CL_N);
+    }
 
     return ret;
 }
 
-
 static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
 {
-    double diff;
-    char algo[64] = { 0 };
-    char algo_display[32] = { 0 };
+	double diff;
+	char algo[64] = { 0 };
 
-    diff = json_number_value(json_array_get(params, 0));
-    if (diff <= 0.0)
-        return false;
+	diff = json_number_value(json_array_get(params, 0));
+	if (diff <= 0.0)
+		return false;
 
-    pthread_mutex_lock(&stratum_work_lock);
-    sctx->next_diff = diff;
-    pthread_mutex_unlock(&stratum_work_lock);
+	pthread_mutex_lock(&stratum_work_lock);
+	sctx->next_diff = diff;
+	pthread_mutex_unlock(&stratum_work_lock);
 
-    get_currentalgo(algo, sizeof(algo));
-    snprintf(algo_display, sizeof(algo_display), "[%s]", algo);
+	get_currentalgo(algo, sizeof(algo));
 
-    double inverse_diff = 1.0 / diff;
+	applog(LOG_INFO, "Difficulty set to %.10f [%s][%d]",
+		diff,
+		algo,
+		sctx->pooln
+	);
 
-    // timestamp giống job log
-    time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
-    char timestamp[32];
-    strftime(timestamp, sizeof(timestamp), "[%Y-%m-%d %H:%M:%S]", tm_info);
-
-    applog(LOG_INFO, "%s Difficulty %.10f %s[%d]",
-        timestamp,
-        inverse_diff,
-        algo_display,
-        sctx->pooln
-    );
-
-    return true;
+	return true;
 }
-
-
 static bool stratum_reconnect(struct stratum_ctx *sctx, json_t *params)
 {
 	json_t *port_val;
