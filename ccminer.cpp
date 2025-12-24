@@ -529,6 +529,7 @@ Options:\n\
       --syslog-prefix=... allow to change syslog tool name\n"
 #endif
 "\
+      --watchdog[=N]    watchdog \n\
       --hide-diff       hide submitted block and net difficulty (old mode)\n\
   -B, --background      run the miner in the background\n\
       --benchmark       run in offline benchmark mode\n\
@@ -612,6 +613,7 @@ struct option options[] = {
 	{ "tlimit", 1, NULL, 1075 },
 	{ "led", 1, NULL, 1080 },
 	{ "max-log-rate", 1, NULL, 1019 },
+	{ "watchdog", 2, NULL, 1082 },
 #ifdef HAVE_SYSLOG_H
 	{ "syslog", 0, NULL, 'S' },
 	{ "syslog-prefix", 1, NULL, 1018 },
@@ -3632,6 +3634,9 @@ static void extract_worker_name(const char *username)
 // 	snprintf(p->short_url, sizeof(p->short_url), "%s", short_url);
 // 	extract_worker_name(p->user); 
 // }
+static bool watchdog_enabled = true;
+static pthread_t watchdog_thr_id;
+static int opt_watchdog_timeout = 300;
 static void display_miner_status()
 {
     char algo_display[32];
@@ -3646,6 +3651,20 @@ static void display_miner_status()
     int minutes = (runtime % 3600) / 60;
     int seconds = runtime % 60;
     
+    // Get CPU usage
+    double cpu_usage = get_cpu_usage();
+    const char* cpu_color = cpu_usage > 80.0 ? CL_RED : 
+                           (cpu_usage > 60.0 ? CL_YLW : CL_GRN);
+    
+    // Get memory usage
+    unsigned long total_mem_kb = 0, avail_mem_kb = 0;
+    get_memory_usage(&total_mem_kb, &avail_mem_kb);
+    unsigned long used_mem_kb = total_mem_kb - avail_mem_kb;
+    double mem_usage_percent = (double)used_mem_kb * 100.0 / (double)total_mem_kb;
+    const char* mem_color = mem_usage_percent > 80.0 ? CL_RED : 
+                           (mem_usage_percent > 60.0 ? CL_YLW : CL_GRN);
+    
+    // Get hashrate
     double total_hashrate = 0;
     pthread_mutex_lock(&stats_lock);
     for (int i = 0; i < opt_n_threads; i++)
@@ -3655,6 +3674,7 @@ static void display_miner_status()
     char hashrate_str[64];
     format_hashrate(total_hashrate, hashrate_str);
     
+    // Get shares info
     uint64_t total_accepted = 0;
     uint64_t total_rejected = 0;
     for (int i = 0; i < num_pools; i++) {
@@ -3665,10 +3685,11 @@ static void display_miner_status()
     double accept_rate = total_shares_submitted > 0 ? 
         (double)total_accepted * 100.0 / total_shares_submitted : 0.0;
     
+    // Display status
     applog(LOG_INFO, 
         "%s================================================================%s",
         CL_GRY, CL_N);
-    applog(LOG_INFO, "%sCcminer status%s %s", CL_CYN, CL_N, algo_display);
+    applog(LOG_INFO, "%sCcminer Status%s %s", CL_CYN, CL_N, algo_display);
     applog(LOG_INFO, 
         "%s================================================================%s",
         CL_GRY, CL_N);
@@ -3680,8 +3701,25 @@ static void display_miner_status()
     
     applog(LOG_INFO, "%sUptime      :%s %02d:%02d:%02d", 
         CL_CYN, CL_N, hours, minutes, seconds);
+    
+    // CPU & Memory usage
+    applog(LOG_INFO, "%sCPU Usage   :%s %s%.1f%%%s %s(%d threads)%s", 
+        CL_CYN, CL_N, cpu_color, cpu_usage, CL_N,
+        CL_GRY, opt_n_threads, CL_N);
+    
+    applog(LOG_INFO, "%sMemory      :%s %s%.1f%%%s %s(%.2f GB / %.2f GB)%s",
+        CL_CYN, CL_N, 
+        mem_color, mem_usage_percent, CL_N,
+        CL_GRY,
+        (double)used_mem_kb / (1024.0 * 1024.0),
+        (double)total_mem_kb / (1024.0 * 1024.0),
+        CL_N);
+    
+    // Hashrate
     applog(LOG_INFO, "%sHashrate    :%s %s", 
         CL_CYN, CL_N, hashrate_str);
+    
+    // Shares
     applog(LOG_INFO, "%sAccepted    :%s %s%lu%s %s(%.1f%%)%s", 
         CL_CYN, CL_N, CL_GRN, total_accepted, CL_N,
         CL_GRY, accept_rate, CL_N);
@@ -3690,21 +3728,43 @@ static void display_miner_status()
     applog(LOG_INFO, "%sSubmitted   :%s %lu", 
         CL_CYN, CL_N, total_shares_submitted);
     
+    // Ping stats
     if (min_ping_ms < 999999.0) {
         const char* min_color = min_ping_ms < 100 ? CL_GRN : 
                                (min_ping_ms < 300 ? CL_YLW : CL_RED);
         const char* max_color = max_ping_ms < 100 ? CL_GRN : 
                                (max_ping_ms < 300 ? CL_YLW : CL_RED);
-        applog(LOG_INFO, "%sMin Ping    :%s %s%.0f ms%s", 
-            CL_CYN, CL_N, min_color, min_ping_ms, CL_N);
-        applog(LOG_INFO, "%sMax Ping    :%s %s%.0f ms%s", 
-            CL_CYN, CL_N, max_color, max_ping_ms, CL_N);
+        const char* avg_color;
+        double avg_ping = (min_ping_ms + max_ping_ms) / 2.0;
+        avg_color = avg_ping < 100 ? CL_GRN : 
+                   (avg_ping < 300 ? CL_YLW : CL_RED);
+        
+        applog(LOG_INFO, "%sPing        :%s Min %s%.0f%s / Avg %s%.0f%s / Max %s%.0f ms%s", 
+            CL_CYN, CL_N, 
+            min_color, min_ping_ms, CL_N,
+            avg_color, avg_ping, CL_N,
+            max_color, max_ping_ms, CL_N);
     }
     
+    // Pool info
     applog(LOG_INFO, "%sDifficulty  :%s %.10f", 
         CL_CYN, CL_N, stratum_diff);
     applog(LOG_INFO, "%sPool        :%s %s", 
         CL_CYN, CL_N, pools[cur_pooln].url);
+    
+    // Watchdog status
+    applog(LOG_INFO, "%sWatchdog    :%s %s%s%s", 
+        CL_CYN, CL_N,
+        watchdog_enabled ? CL_GRN : CL_RED,
+        watchdog_enabled ? "Enabled" : "Disabled",
+        CL_N);
+    
+    // Mining status
+    const char* status_color = ccminer_paused ? CL_YLW : CL_GRN;
+    const char* status_text = ccminer_paused ? "Paused" : "Mining";
+    applog(LOG_INFO, "%sStatus      :%s %s%s%s", 
+        CL_CYN, CL_N, status_color, status_text, CL_N);
+    
     applog(LOG_INFO, 
         "%s================================================================%s",
         CL_GRY, CL_N);
@@ -3713,6 +3773,7 @@ static void display_miner_status()
 static void* keyboard_thread(void* arg)
 {
     char c;
+    bool show_help = false;
     
     while (!abort_flag) {
         c = getchar();
@@ -3734,6 +3795,20 @@ static void* keyboard_thread(void* arg)
                 }
                 break;
                 
+            case 'h':
+            case 'H':
+            case '?':
+                show_help = !show_help;
+                if (show_help) {
+                    applog(LOG_INFO, "%s=== Interactive Commands ===%s", CL_CYN, CL_N);
+                    applog(LOG_INFO, "%ss%s - Show mining status", CL_GRN, CL_N);
+                    applog(LOG_INFO, "%sp%s - Pause/Resume mining", CL_GRN, CL_N);
+                    applog(LOG_INFO, "%sh%s - Show/Hide this help", CL_GRN, CL_N);
+                    applog(LOG_INFO, "%sk/q%s - Exit miner", CL_GRN, CL_N);
+                    applog(LOG_INFO, "%s=========================%s", CL_CYN, CL_N);
+                }
+                break;
+                
             case 'k':
             case 'K':
             case 'q':
@@ -3748,7 +3823,6 @@ static void* keyboard_thread(void* arg)
     
     return NULL;
 }
-
 
 int main(int argc, char *argv[])
 {
@@ -3806,11 +3880,6 @@ printf("%sCache:%s L1 %ld KB %s|%s L2 %ld KB %s|%s L3 %ld KB\n",
     CL_GRY, CL_N, l2/1024,
     CL_GRY, CL_N, l3/1024);
 
-if (worker_name && strcmp(worker_name, "default") != 0) {
-        applog(LOG_INFO, "%sWorker      :%s %s", 
-            CL_CYN, CL_N, worker_name);
-    } 
-
 rpc_user = strdup("");
 rpc_pass = strdup("x");
 rpc_url = strdup("");
@@ -3853,8 +3922,6 @@ jane_params = strdup("");
 		device_interactive[i] = -1;
 		device_texturecache[i] = -1;
 		device_singlememory[i] = -1;
-		//device_pstate[i] = -1;
-		//device_led[i] = -1;
 	}
 
 	
@@ -3903,7 +3970,18 @@ jane_params = strdup("");
 		opt_extranonce = false; // disable subscribe
 	}
 
+	if (worker_name && strcmp(worker_name, "default") != 0) {
+		applog(LOG_INFO, "%sWorker      :%s %s", 
+			CL_CYN, CL_N, worker_name);
+	}
 
+	if (watchdog_enabled) {
+		applog(LOG_INFO, "%sWatchdog    :%s %sEnabled%s", 
+			CL_CYN, CL_N, CL_GRN, CL_N);
+	} else {
+		applog(LOG_INFO, "%sWatchdog    :%s %sDisabled%s %s(use --watchdog to enable)%s", 
+			CL_CYN, CL_N, CL_YLW, CL_N, CL_GRY, CL_N);
+	}
 
 	flags = !opt_benchmark && strncmp(rpc_url, "https:", 6)
 	      ? (CURL_GLOBAL_ALL & ~CURL_GLOBAL_SSL)
