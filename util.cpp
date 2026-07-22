@@ -194,17 +194,41 @@ void get_defconfig_path(char *out, size_t bufsize, char *argv0)
 	char *dir = dirname(cmd);
 	const char *sep = strstr(dir, "\\") ? "\\" : "/";
 	struct stat info;
+
+	// 1) ccminer.conf in the current working directory
+	//    (so plain "./ccminer" or "ccminer" picks it up automatically)
+	snprintf(out, bufsize, "ccminer.conf");
+	if (stat(out, &info) == 0) {
+		out[bufsize - 1] = '\0';
+		free(cmd);
+		return;
+	}
+
+	// 2) per-user config folder
 #ifdef WIN32
-	snprintf(out, bufsize, "%s\\ccminer\\ccminer.conf\0", getenv("APPDATA"));
+	snprintf(out, bufsize, "%s\\ccminer\\ccminer.conf", getenv("APPDATA"));
 #else
-	snprintf(out, bufsize, "%s\\.ccminer\\ccminer.conf", getenv("HOME"));
+	snprintf(out, bufsize, "%s/.ccminer/ccminer.conf", getenv("HOME"));
 #endif
-	if (dir && stat(out, &info) != 0) {
-		// binary folder if not present in user folder
-		snprintf(out, bufsize, "%s%sccminer.conf%s", dir, sep, "");
+	if (stat(out, &info) == 0) {
+		out[bufsize - 1] = '\0';
+		free(cmd);
+#ifdef WIN32
+		if (dir) free(dir);
+#endif
+		return;
+	}
+
+	// 3) folder containing the binary itself
+	if (dir) {
+		snprintf(out, bufsize, "%s%sccminer.conf", dir, sep);
 	}
 	if (stat(out, &info) != 0) {
 		out[0] = '\0';
+		free(cmd);
+#ifdef WIN32
+		if (dir) free(dir);
+#endif
 		return;
 	}
 	out[bufsize - 1] = '\0';
